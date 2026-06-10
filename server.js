@@ -11,7 +11,8 @@ const ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 // TABELA DE PREÇOS POR SISTEMA
 const PRECOS = {
     triagem: { 30: 40,  60: 75,  90: 110 },
-    agenda:  { 30: 80,  60: 150, 90: 220 }
+    agenda:  { 30: 80,  60: 150, 90: 220 },
+    vendas:  { 30: 120, 60: 220, 90: 320 }
 };
 
 app.post('/criar-pagamento', async (req, res) => {
