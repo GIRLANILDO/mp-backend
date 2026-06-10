@@ -1,3 +1,4 @@
+
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -9,11 +10,10 @@ app.use(express.json());
 // ============================================================
 // CREDENCIAIS
 // ============================================================
-const ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN; // Token principal (licenças)
+const ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-// Firebase REST API (para o webhook dar baixa nas parcelas)
 const FIREBASE_PROJECT = 'sisvenda-775d9';
-const FIREBASE_API_KEY  = process.env.FIREBASE_API_KEY; // Adicione no Railway
+const FIREBASE_API_KEY  = process.env.FIREBASE_API_KEY;
 
 // ============================================================
 // TABELA DE PREÇOS — LICENÇAS DO SISTEMA
@@ -25,12 +25,12 @@ const PRECOS = {
 };
 
 // ============================================================
-// ROTA 1 — Criar pagamento de LICENÇA (já existia)
+// ROTA 1 — Criar pagamento de LICENÇA
 // ============================================================
 app.post('/criar-pagamento', async (req, res) => {
     try {
-        const body   = req.body;
-        const dias   = parseInt(body.metadata?.dias) || 30;
+        const body    = req.body;
+        const dias    = parseInt(body.metadata?.dias) || 30;
         const sistema = body.metadata?.sistema || 'triagem';
         const tabela  = PRECOS[sistema] || PRECOS['triagem'];
         const preco   = tabela[dias];
@@ -67,7 +67,7 @@ app.post('/criar-pagamento', async (req, res) => {
 });
 
 // ============================================================
-// ROTA 2 — Verificar status de pagamento de LICENÇA (já existia)
+// ROTA 2 — Verificar status de pagamento de LICENÇA
 // ============================================================
 app.get('/status/:id', async (req, res) => {
     try {
@@ -82,17 +82,7 @@ app.get('/status/:id', async (req, res) => {
 });
 
 // ============================================================
-// ROTA 3 — Criar pagamento Pix de PARCELA (nova)
-//
-// Body esperado:
-// {
-//   mpAccessToken: "APP_USR-...",   <- token da ótica
-//   installmentId: "abc123",        <- ID da parcela no Firestore
-//   amount: 150.00,                 <- valor da parcela
-//   dueDate: "2025-08-10",          <- data de vencimento (YYYY-MM-DD)
-//   description: "Parcela 2/6 - Maria Silva",
-//   payerEmail: "cliente@email.com"
-// }
+// ROTA 3 — Criar pagamento Pix de PARCELA
 // ============================================================
 app.post('/criar-parcela', async (req, res) => {
     try {
@@ -109,10 +99,11 @@ app.post('/criar-parcela', async (req, res) => {
         if (!installmentId) return res.status(400).json({ error: 'ID da parcela não informado.' });
         if (!amount || amount <= 0) return res.status(400).json({ error: 'Valor inválido.' });
 
-        // Expiração: 1 ano a partir do vencimento da parcela (ou hoje se não informado)
+        // Expiração: 1 ano a partir do vencimento da parcela
         const base = dueDate ? new Date(dueDate + 'T12:00:00') : new Date();
         const expiration = new Date(base);
         expiration.setFullYear(expiration.getFullYear() + 1);
+
         // Formato exato exigido pelo MP: yyyy-MM-ddTHH:mm:ss+00:00
         const pad = (n) => String(n).padStart(2, '0');
         const expirationISO = `${expiration.getUTCFullYear()}-${pad(expiration.getUTCMonth()+1)}-${pad(expiration.getUTCDate())}T${pad(expiration.getUTCHours())}:${pad(expiration.getUTCMinutes())}:${pad(expiration.getUTCSeconds())}+00:00`;
@@ -130,7 +121,6 @@ app.post('/criar-parcela', async (req, res) => {
                     last_name: 'Otica',
                     identification: { type: 'CPF', number: '00000000000' }
                 },
-                // Guardamos o installmentId nos metadados para o webhook identificar
                 metadata: {
                     installment_id: installmentId,
                     tipo: 'parcela'
@@ -163,33 +153,19 @@ app.post('/criar-parcela', async (req, res) => {
 });
 
 // ============================================================
-// ROTA 4 — Webhook do Mercado Pago (nova)
-//
-// O MP chama esta rota quando um pagamento é aprovado.
-// Ela busca o installment_id nos metadados e dá baixa no Firebase.
-//
-// URL para cadastrar no painel de cada ótica:
-// https://intuitive-surprise-production-8572.up.railway.app/webhook
+// ROTA 4 — Webhook do Mercado Pago
+// URL: https://intuitive-surprise-production-8572.up.railway.app/webhook
 // ============================================================
 app.post('/webhook', async (req, res) => {
-    // Responde 200 imediatamente para o MP não reenviar
     res.sendStatus(200);
 
     try {
         const { type, data } = req.body;
-
-        // Só processa notificações de pagamento aprovado
         if (type !== 'payment') return;
 
         const paymentId = data?.id;
         if (!paymentId) return;
 
-        // Precisamos descobrir qual token usar para consultar este pagamento.
-        // Como o webhook não informa o token da ótica, consultamos o Firebase
-        // para encontrar a parcela pelo paymentId e depois obter o token da ótica.
-        // Estratégia: buscar a parcela no Firestore via REST API.
-
-        // 1. Busca a parcela pelo mpPaymentId no Firestore
         const queryUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents:runQuery?key=${FIREBASE_API_KEY}`;
 
         const queryBody = {
@@ -214,14 +190,12 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
-        const docPath = docs[0].document.name; // ex: projects/.../documents/installments/ABC123
+        const docPath = docs[0].document.name;
         const fields  = docs[0].document.fields;
         const ownerId = fields?.ownerId?.stringValue;
 
-        // Se já está pago, ignora
         if (fields?.pago?.booleanValue === true) return;
 
-        // 2. Busca o token da ótica no settings/{ownerId}
         let mpToken = null;
         if (ownerId) {
             const settingsUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents/settings/${ownerId}?key=${FIREBASE_API_KEY}`;
@@ -234,7 +208,6 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
-        // 3. Confirma o status do pagamento diretamente no MP com o token da ótica
         const statusRes = await axios.get(
             `https://api.mercadopago.com/v1/payments/${paymentId}`,
             { headers: { Authorization: `Bearer ${mpToken}` } }
@@ -242,10 +215,7 @@ app.post('/webhook', async (req, res) => {
 
         if (statusRes.data.status !== 'approved') return;
 
-        // 4. Dá baixa na parcela no Firestore
         const hoje = new Date().toISOString();
-        const installmentId = docPath.split('/').pop();
-
         const patchUrl = `https://firestore.googleapis.com/v1/${docPath}?key=${FIREBASE_API_KEY}&updateMask.fieldPaths=pago&updateMask.fieldPaths=dataPagamento&updateMask.fieldPaths=meioPagamento`;
 
         await axios.patch(patchUrl, {
@@ -256,6 +226,7 @@ app.post('/webhook', async (req, res) => {
             }
         });
 
+        const installmentId = docPath.split('/').pop();
         console.log(`✅ Baixa automática: parcela ${installmentId} paga via MP (paymentId: ${paymentId})`);
 
     } catch (err) {
