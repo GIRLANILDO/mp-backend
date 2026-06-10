@@ -214,10 +214,12 @@ app.post('/webhook', async (req, res) => {
         if (statusRes.data.status !== 'approved') return;
 
         // 4. Dá baixa na parcela
+        const hoje = new Date().toISOString();
         await docRef.update({
             pago: true,
             status: 'pago',
-            dataPagamento: new Date().toISOString(),
+            paymentDate: hoje,
+            dataPagamento: hoje,
             meioPagamento: 'PIX (automático)'
         });
 
