@@ -1,4 +1,3 @@
-
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -7,26 +6,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ============================================================
-// CREDENCIAIS
-// ============================================================
 const ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
 const FIREBASE_PROJECT = 'sisvenda-775d9';
 const FIREBASE_API_KEY  = process.env.FIREBASE_API_KEY;
 
-// ============================================================
-// TABELA DE PREÇOS — LICENÇAS DO SISTEMA
-// ============================================================
 const PRECOS = {
     triagem: { 30: 40,  60: 75,  90: 110  },
     agenda:  { 30: 80,  60: 150, 90: 220  },
     vendas:  { 30: 120, 60: 220, 90: 320  }
 };
 
-// ============================================================
-// ROTA 1 — Criar pagamento de LICENÇA
-// ============================================================
 app.post('/criar-pagamento', async (req, res) => {
     try {
         const body    = req.body;
@@ -66,9 +56,6 @@ app.post('/criar-pagamento', async (req, res) => {
     }
 });
 
-// ============================================================
-// ROTA 2 — Verificar status de pagamento de LICENÇA
-// ============================================================
 app.get('/status/:id', async (req, res) => {
     try {
         const response = await axios.get(
@@ -81,9 +68,6 @@ app.get('/status/:id', async (req, res) => {
     }
 });
 
-// ============================================================
-// ROTA 3 — Criar pagamento Pix de PARCELA
-// ============================================================
 app.post('/criar-parcela', async (req, res) => {
     try {
         const {
@@ -99,14 +83,19 @@ app.post('/criar-parcela', async (req, res) => {
         if (!installmentId) return res.status(400).json({ error: 'ID da parcela não informado.' });
         if (!amount || amount <= 0) return res.status(400).json({ error: 'Valor inválido.' });
 
-        // Expiração: 1 ano a partir do vencimento da parcela
         const base = dueDate ? new Date(dueDate + 'T12:00:00') : new Date();
         const expiration = new Date(base);
         expiration.setFullYear(expiration.getFullYear() + 1);
 
-        // Formato exato exigido pelo MP: yyyy-MM-ddTHH:mm:ss+00:00
         const pad = (n) => String(n).padStart(2, '0');
-        const expirationISO = `${expiration.getUTCFullYear()}-${pad(expiration.getUTCMonth()+1)}-${pad(expiration.getUTCDate())}T${pad(expiration.getUTCHours())}:${pad(expiration.getUTCMinutes())}:${pad(expiration.getUTCSeconds())}+00:00`;
+        const expirationISO = expiration.getUTCFullYear() + '-' +
+            pad(expiration.getUTCMonth()+1) + '-' +
+            pad(expiration.getUTCDate()) + 'T' +
+            pad(expiration.getUTCHours()) + ':' +
+            pad(expiration.getUTCMinutes()) + ':' +
+            pad(expiration.getUTCSeconds()) + '.000-04:00';
+
+        console.log('date_of_expiration enviado:', expirationISO);
 
         const response = await axios.post(
             'https://api.mercadopago.com/v1/payments',
@@ -147,15 +136,11 @@ app.post('/criar-parcela', async (req, res) => {
         });
 
     } catch (err) {
-        console.error('Erro /criar-parcela:', err.response?.data || err.message);
+        console.error('Erro /criar-parcela:', JSON.stringify(err.response?.data || err.message));
         res.status(500).json({ error: err.message });
     }
 });
 
-// ============================================================
-// ROTA 4 — Webhook do Mercado Pago
-// URL: https://intuitive-surprise-production-8572.up.railway.app/webhook
-// ============================================================
 app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 
@@ -234,6 +219,5 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor rodando na porta ' + PORT));
