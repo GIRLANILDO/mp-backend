@@ -119,7 +119,7 @@ app.post('/criar-parcela', async (req, res) => {
                 headers: {
                     Authorization: `Bearer ${mpAccessToken}`,
                     'Content-Type': 'application/json',
-                    'X-Idempotency-Key': `parcela-${installmentId}-${Date.now()}`
+                    'X-Idempotency-Key': Date.now().toString()
                 }
             }
         );
