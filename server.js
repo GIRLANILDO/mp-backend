@@ -219,6 +219,7 @@ app.post('/webhook', async (req, res) => {
             pago: true,
             status: 'pago',
             paymentDate: hoje,
+            paymentMethod: 'PIX',
             dataPagamento: hoje,
             meioPagamento: 'PIX (automático)'
         });
