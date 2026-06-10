@@ -225,6 +225,15 @@ app.post('/webhook', async (req, res) => {
 
         console.log(`✅ Baixa automática: parcela ${docRef.id} paga via MP (paymentId: ${paymentId})`);
 
+        // Grava notificação para o push no navegador
+        await db.collection('notificacoes').add({
+            ownerId: ownerId,
+            titulo: 'Pagamento Recebido!',
+            mensagem: `Parcela ${docData.number}/${docData.total} de ${docData.clientName} — R$ ${parseFloat(docData.amount).toFixed(2).replace('.', ',')} pago via PIX`,
+            lida: false,
+            timestamp: new Date()
+        });
+
     } catch (err) {
         console.error('Erro no webhook:', err.response?.data || err.message);
     }
