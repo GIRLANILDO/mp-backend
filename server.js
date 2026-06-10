@@ -113,7 +113,9 @@ app.post('/criar-parcela', async (req, res) => {
         const base = dueDate ? new Date(dueDate + 'T12:00:00') : new Date();
         const expiration = new Date(base);
         expiration.setFullYear(expiration.getFullYear() + 1);
-        const expirationISO = expiration.toISOString().replace('.000', '+00:00');
+        // Formato exato exigido pelo MP: yyyy-MM-ddTHH:mm:ss+00:00
+        const pad = (n) => String(n).padStart(2, '0');
+        const expirationISO = `${expiration.getUTCFullYear()}-${pad(expiration.getUTCMonth()+1)}-${pad(expiration.getUTCDate())}T${pad(expiration.getUTCHours())}:${pad(expiration.getUTCMinutes())}:${pad(expiration.getUTCSeconds())}+00:00`;
 
         const response = await axios.post(
             'https://api.mercadopago.com/v1/payments',
