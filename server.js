@@ -8,27 +8,28 @@ app.use(express.json());
 
 const ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-// TABELA DE PREÇOS NO SERVIDOR (não pode ser alterada pelo cliente)
+// TABELA DE PREÇOS POR SISTEMA
 const PRECOS = {
-    30: 40,
-    60: 75,
-    90: 110
+    triagem: { 30: 40,  60: 75,  90: 110 },
+    agenda:  { 30: 80,  60: 150, 90: 220 }
 };
 
 app.post('/criar-pagamento', async (req, res) => {
     try {
         const body = req.body;
         const dias = parseInt(body.metadata?.dias) || 30;
+        const sistema = body.metadata?.sistema || 'triagem';
 
-        // Preço vem do servidor, não do cliente
-        const preco = PRECOS[dias];
+        const tabelaPrecos = PRECOS[sistema] || PRECOS['triagem'];
+        const preco = tabelaPrecos[dias];
+
         if (!preco) return res.status(400).json({ error: 'Plano inválido.' });
 
         const response = await axios.post(
             'https://api.mercadopago.com/v1/payments',
             {
                 transaction_amount: preco,
-                description: `Licença ${dias} dias`,
+                description: `Licença ${dias} dias - ${sistema}`,
                 payment_method_id: 'pix',
                 payer: {
                     email: body.payer.email,
