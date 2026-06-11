@@ -241,5 +241,91 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================================================
+// VERIFICAÇÃO AUTOMÁTICA — a cada 5 minutos confere parcelas pendentes
+// ============================================================
+const verificarParcelasPendentes = async () => {
+    try {
+        console.log('🔍 Verificando parcelas pendentes...');
+
+        // Busca parcelas com mpPaymentId preenchido e ainda pendentes
+        const snapshot = await db.collection('installments')
+            .where('pago', '==', false)
+            .where('status', '==', 'pendente')
+            .get();
+
+        if (snapshot.empty) return;
+
+        let baixasFeitas = 0;
+
+        for (const doc of snapshot.docs) {
+            const data = doc.data();
+            const mpPaymentId = data.mpPaymentId;
+
+            // Ignora parcelas sem QR do MP (antigas com QR estático)
+            if (!mpPaymentId || mpPaymentId === 'null') continue;
+
+            const ownerId = data.ownerId;
+            if (!ownerId) continue;
+
+            try {
+                // Busca token da ótica
+                const settingsDoc = await db.collection('settings').doc(ownerId).get();
+                if (!settingsDoc.exists) continue;
+                const mpToken = settingsDoc.data()?.mpAccessToken;
+                if (!mpToken) continue;
+
+                // Consulta status no MP
+                const statusRes = await axios.get(
+                    `https://api.mercadopago.com/v1/payments/${mpPaymentId}`,
+                    { headers: { Authorization: `Bearer ${mpToken}` } }
+                );
+
+                if (statusRes.data.status !== 'approved') continue;
+
+                // Dá baixa
+                const hoje = new Date().toISOString();
+                await doc.ref.update({
+                    pago: true,
+                    status: 'pago',
+                    paymentDate: hoje,
+                    paymentMethod: 'PIX',
+                    dataPagamento: hoje,
+                    meioPagamento: 'PIX (automático)'
+                });
+
+                // Grava notificação
+                await db.collection('notificacoes').add({
+                    ownerId: ownerId,
+                    titulo: 'Pagamento Recebido!',
+                    mensagem: `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via PIX`,
+                    lida: false,
+                    timestamp: new Date()
+                });
+
+                baixasFeitas++;
+                console.log(`✅ Baixa automática (verificação): parcela ${doc.id} (paymentId: ${mpPaymentId})`);
+
+            } catch (e) {
+                // Ignora erros individuais para não parar a verificação
+                continue;
+            }
+        }
+
+        if (baixasFeitas > 0) {
+            console.log(`✅ Verificação concluída: ${baixasFeitas} baixa(s) feita(s)`);
+        }
+
+    } catch (err) {
+        console.error('Erro na verificação automática:', err.message);
+    }
+};
+
+// Roda a cada 5 minutos
+setInterval(verificarParcelasPendentes, 5 * 60 * 1000);
+
+// Roda uma vez ao iniciar o servidor
+setTimeout(verificarParcelasPendentes, 10000);
+
+// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor rodando na porta ' + PORT));
