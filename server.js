@@ -150,7 +150,6 @@ app.post('/webhook', async (req, res) => {
         if (type !== 'payment') return;
         const paymentId = data?.id;
         if (!paymentId) return;
-        // 1. Busca a parcela pelo mpPaymentId no Firestore
         const snapshot = await db.collection('installments')
             .where('mpPaymentId', '==', String(paymentId))
             .limit(1)
@@ -163,7 +162,6 @@ app.post('/webhook', async (req, res) => {
         const docData = snapshot.docs[0].data();
         const ownerId = docData.ownerId;
         if (docData.pago === true) return;
-        // 2. Busca o token da ótica no settings
         let mpToken = null;
         if (ownerId) {
             const settingsDoc = await db.collection('settings').doc(ownerId).get();
@@ -175,13 +173,11 @@ app.post('/webhook', async (req, res) => {
             console.log(`Webhook: token não encontrado para ownerId ${ownerId}`);
             return;
         }
-        // 3. Confirma o status no MP
         const statusRes = await axios.get(
             `https://api.mercadopago.com/v1/payments/${paymentId}`,
             { headers: { Authorization: `Bearer ${mpToken}` } }
         );
         if (statusRes.data.status !== 'approved') return;
-        // 4. Dá baixa na parcela
         const hoje = new Date().toISOString();
         await docRef.update({
             pago: true,
@@ -192,7 +188,6 @@ app.post('/webhook', async (req, res) => {
             meioPagamento: 'PIX (automático)'
         });
         console.log(`✅ Baixa automática: parcela ${docRef.id} paga via MP (paymentId: ${paymentId})`);
-        // Grava notificação
         await db.collection('notificacoes').add({
             ownerId: ownerId,
             titulo: 'Pagamento Recebido!',
@@ -205,21 +200,33 @@ app.post('/webhook', async (req, res) => {
     }
 });
 // ============================================================
-// ROTA 5 — Criar pagamento Pix de PARCELA (Asaas)       ← NOVO
+// ROTA 5 — Criar pagamento Pix de PARCELA (Asaas)
 // ============================================================
 const ASAAS_BASE = process.env.ASAAS_BASE_URL || 'https://api.asaas.com/api/v3';
 
 async function obterOuCriarClienteAsaas(apiKey, payerName, payerCpfCnpj, payerEmail) {
     const headers = { 'access_token': apiKey, 'Content-Type': 'application/json' };
+    console.log('[Asaas] Base URL:', ASAAS_BASE);
     if (payerCpfCnpj) {
         const cpfLimpo = payerCpfCnpj.replace(/\D/g, '');
-        const res = await axios.get(`${ASAAS_BASE}/customers?cpfCnpj=${cpfLimpo}&limit=1`, { headers });
-        if (res.data.data && res.data.data.length > 0) return res.data.data[0].id;
+        console.log('[Asaas] Buscando cliente por CPF:', cpfLimpo);
+        try {
+            const res = await axios.get(`${ASAAS_BASE}/customers?cpfCnpj=${cpfLimpo}&limit=1`, { headers });
+            if (res.data.data && res.data.data.length > 0) {
+                console.log('[Asaas] Cliente encontrado:', res.data.data[0].id);
+                return res.data.data[0].id;
+            }
+        } catch(e) {
+            console.error('[Asaas] Erro ao buscar cliente:', e.response?.status, JSON.stringify(e.response?.data));
+        }
     }
+    console.log('[Asaas] Criando cliente:', payerName);
     const payload = { name: payerName || 'Cliente' };
     if (payerCpfCnpj) payload.cpfCnpj = payerCpfCnpj.replace(/\D/g, '');
     if (payerEmail)   payload.email    = payerEmail;
+    console.log('[Asaas] Payload cliente:', JSON.stringify(payload));
     const res = await axios.post(`${ASAAS_BASE}/customers`, payload, { headers });
+    console.log('[Asaas] Cliente criado:', res.data.id);
     return res.data.id;
 }
 
@@ -237,6 +244,7 @@ app.post('/criar-parcela-asaas', async (req, res) => {
         const customerId = await obterOuCriarClienteAsaas(asaasApiKey, payerName, payerCpfCnpj, payerEmail);
 
         // 2. Cria cobrança PIX
+        console.log('[Asaas] Criando pagamento para cliente:', customerId, 'valor:', amount, 'venc:', dueDate);
         const pagamentoRes = await axios.post(`${ASAAS_BASE}/payments`, {
             customer:          customerId,
             billingType:       'PIX',
@@ -246,10 +254,13 @@ app.post('/criar-parcela-asaas', async (req, res) => {
             externalReference: installmentId
         }, { headers });
         const pagamento = pagamentoRes.data;
+        console.log('[Asaas] Pagamento criado:', pagamento.id, 'status:', pagamento.status);
 
         // 3. Busca QR Code
+        console.log('[Asaas] Buscando QR Code para pagamento:', pagamento.id);
         const qrRes = await axios.get(`${ASAAS_BASE}/payments/${pagamento.id}/pixQrCode`, { headers });
         const qrData = qrRes.data;
+        console.log('[Asaas] QR Code obtido, encodedImage length:', qrData.encodedImage?.length);
 
         res.json({
             paymentId:     pagamento.id,
@@ -258,20 +269,20 @@ app.post('/criar-parcela-asaas', async (req, res) => {
             status:        pagamento.status
         });
     } catch (err) {
-        console.error('Erro /criar-parcela-asaas:', err.response?.data || err.message);
+        console.error('[Asaas] Erro status:', err.response?.status);
+        console.error('[Asaas] Erro data:', JSON.stringify(err.response?.data));
+        console.error('[Asaas] Erro msg:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
 // ============================================================
-// ROTA 6 — Webhook do Asaas                              ← NOVO
-// Configure em: Asaas → Minha Conta → Integrações → Webhooks
+// ROTA 6 — Webhook do Asaas
 // URL: https://intuitive-surprise-production-8572.up.railway.app/webhook/asaas
 // Eventos: PAYMENT_RECEIVED, PAYMENT_CONFIRMED
 // ============================================================
 app.post('/webhook/asaas', async (req, res) => {
     res.sendStatus(200);
     try {
-        // Valida token de segurança (configure ASAAS_WEBHOOK_TOKEN no Railway)
         const webhookToken = process.env.ASAAS_WEBHOOK_TOKEN;
         if (webhookToken) {
             const tokenRecebido = req.headers['asaas-access-token'];
@@ -280,26 +291,21 @@ app.post('/webhook/asaas', async (req, res) => {
                 return;
             }
         }
-
         const { event, payment } = req.body;
         if (!['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'].includes(event) || !payment) return;
-
         const installmentId = payment.externalReference;
         if (!installmentId) {
             console.log('Asaas Webhook: pagamento sem externalReference, ignorado.', payment.id);
             return;
         }
-
         const docRef = db.collection('installments').doc(installmentId);
         const snap = await docRef.get();
         if (!snap.exists) {
             console.log(`Asaas Webhook: parcela não encontrada: ${installmentId}`);
             return;
         }
-
         const data = snap.data();
-        if (data.pago === true) return; // idempotência
-
+        if (data.pago === true) return;
         const hoje = new Date().toISOString();
         await docRef.update({
             pago: true,
@@ -310,7 +316,6 @@ app.post('/webhook/asaas', async (req, res) => {
             meioPagamento: 'PIX (automático)',
             asaasPaymentId: payment.id
         });
-
         await db.collection('notificacoes').add({
             ownerId:   data.ownerId,
             titulo:    'Pagamento Recebido!',
@@ -318,7 +323,6 @@ app.post('/webhook/asaas', async (req, res) => {
             lida:      false,
             timestamp: new Date()
         });
-
         console.log(`✅ Baixa automática Asaas: parcela ${installmentId} (paymentId: ${payment.id})`);
     } catch (err) {
         console.error('Erro no webhook Asaas:', err.response?.data || err.message);
@@ -339,7 +343,6 @@ const verificarParcelasPendentes = async () => {
         for (const doc of snapshot.docs) {
             const data = doc.data();
             const mpPaymentId = data.mpPaymentId;
-            // Ignora parcelas sem QR do MP (estáticas ou do Asaas — essas usam webhook)
             if (!mpPaymentId || mpPaymentId === 'null') continue;
             const ownerId = data.ownerId;
             if (!ownerId) continue;
