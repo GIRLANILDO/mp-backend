@@ -216,11 +216,10 @@ async function obterOuCriarClienteAsaas(apiKey, payerName, payerCpfCnpj, payerEm
         const res = await axios.get(`${ASAAS_BASE}/customers?cpfCnpj=${cpfLimpo}&limit=1`, { headers });
         if (res.data.data && res.data.data.length > 0) return res.data.data[0].id;
     }
-    const res = await axios.post(`${ASAAS_BASE}/customers`, {
-        name:    payerName || 'Cliente',
-        cpfCnpj: payerCpfCnpj ? payerCpfCnpj.replace(/\D/g, '') : '00000000000',
-        email:   payerEmail || undefined
-    }, { headers });
+    const payload = { name: payerName || 'Cliente' };
+    if (payerCpfCnpj) payload.cpfCnpj = payerCpfCnpj.replace(/\D/g, '');
+    if (payerEmail)   payload.email    = payerEmail;
+    const res = await axios.post(`${ASAAS_BASE}/customers`, payload, { headers });
     return res.data.id;
 }
 
