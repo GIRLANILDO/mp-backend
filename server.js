@@ -497,24 +497,60 @@ app.post('/asaas/criar-carne', async (req, res) => {
             status:    p.status
         }));
 
-        // 4. Tenta obter URL do carnê PDF (múltiplos boletos por folha)
-        let paymentBookUrl = null;
-        try {
-            const bookRes = await axios.get(
-                `${base}/installments/${installmentGroupId}/paymentBook`,
-                { headers }
-            );
-            paymentBookUrl = bookRes.data?.bankSlipUrl || bookRes.data?.url || null;
-            console.log('[Asaas Carnê] paymentBookUrl:', paymentBookUrl);
-        } catch(e) {
-            console.warn('[Asaas Carnê] paymentBook indisponível, usando boletos individuais. Status:', e.response?.status);
-        }
-
-        res.json({ installmentId: installmentGroupId, paymentBookUrl, payments });
+        // paymentBookUrl é servido via rota proxy GET /asaas/carne/:saleId
+        // (o endpoint do Asaas retorna PDF binário, não URL — por isso usamos o proxy)
+        res.json({ installmentId: installmentGroupId, payments });
     } catch (err) {
         console.error('[Asaas Carnê] Erro status:', err.response?.status);
         console.error('[Asaas Carnê] Erro data:', JSON.stringify(err.response?.data));
         res.status(500).json({ error: err.message, details: err.response?.data });
+    }
+});
+// ============================================================
+// ROTA 9 — Proxy: serve o PDF do carnê Asaas (3 boletos por folha A4)
+// GET /asaas/carne/:saleId
+// O Asaas retorna o carnê como PDF binário — esta rota faz o pipe direto para o navegador
+// ============================================================
+app.get('/asaas/carne/:saleId', async (req, res) => {
+    try {
+        const { saleId } = req.params;
+
+        // Busca a venda para obter ownerId e asaasInstallmentId
+        const saleDoc = await db.collection('sales').doc(saleId).get();
+        if (!saleDoc.exists) return res.status(404).json({ error: 'Venda não encontrada' });
+        const sale = saleDoc.data();
+        const ownerId       = sale.ownerId || sale.userId;
+        const installmentId = sale.asaasInstallmentId;
+        if (!installmentId) return res.status(404).json({ error: 'Carnê Asaas não gerado para esta venda' });
+
+        // Busca token e ambiente nas configurações da loja
+        const settingsDoc = await db.collection('settings').doc(ownerId).get();
+        if (!settingsDoc.exists) return res.status(404).json({ error: 'Configurações não encontradas' });
+        const settings      = settingsDoc.data();
+        const asaasToken    = settings?.asaasToken;
+        const asaasAmbiente = settings?.asaasAmbiente || 'sandbox';
+        if (!asaasToken) return res.status(400).json({ error: 'Token Asaas não configurado' });
+
+        const base = asaasAmbiente === 'producao'
+            ? 'https://api.asaas.com/v3'
+            : 'https://sandbox.asaas.com/api/v3';
+
+        console.log(`[Asaas Carnê PDF] Buscando carnê para venda ${saleId}, installmentId ${installmentId}`);
+
+        // Faz pipe do PDF binário retornado pelo Asaas diretamente para o navegador
+        const pdfRes = await axios.get(
+            `${base}/installments/${installmentId}/paymentBook`,
+            { headers: { 'access_token': asaasToken }, responseType: 'stream' }
+        );
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="carne-${saleId}.pdf"`);
+        pdfRes.data.pipe(res);
+
+        console.log(`[Asaas Carnê PDF] PDF enviado para venda ${saleId}`);
+    } catch (err) {
+        console.error('[Asaas Carnê PDF] Erro:', err.response?.status, err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 // ============================================================
