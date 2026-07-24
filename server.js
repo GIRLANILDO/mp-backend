@@ -286,18 +286,34 @@ app.post('/webhook/asaas', async (req, res) => {
         }
         const { event, payment } = req.body;
         if (!['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'].includes(event) || !payment) return;
-        const installmentId = payment.externalReference;
-        if (!installmentId) {
-            console.log('Asaas Webhook: pagamento sem externalReference, ignorado.', payment.id);
+        // Tenta encontrar a parcela de duas formas:
+        // 1) fluxo antigo: externalReference = installmentId (doc ID no Firebase)
+        // 2) fluxo novo (carnê nativo): externalReference = saleId → busca por asaasPaymentId
+        let docRef = null;
+        let data   = null;
+
+        const externalRef = payment.externalReference;
+        if (externalRef) {
+            const directSnap = await db.collection('installments').doc(externalRef).get();
+            if (directSnap.exists) {
+                docRef = directSnap.ref;
+                data   = directSnap.data();
+            }
+        }
+        if (!docRef) {
+            const q = await db.collection('installments')
+                .where('asaasPaymentId', '==', payment.id)
+                .limit(1)
+                .get();
+            if (!q.empty) {
+                docRef = q.docs[0].ref;
+                data   = q.docs[0].data();
+            }
+        }
+        if (!docRef || !data) {
+            console.log(`Asaas Webhook: parcela não encontrada. ref=${externalRef}, paymentId=${payment.id}`);
             return;
         }
-        const docRef = db.collection('installments').doc(installmentId);
-        const snap = await docRef.get();
-        if (!snap.exists) {
-            console.log(`Asaas Webhook: parcela não encontrada: ${installmentId}`);
-            return;
-        }
-        const data = snap.data();
         if (data.pago === true) return;
         // Detecta se foi boleto ou PIX
         const formaPagamento = payment.billingType === 'BOLETO'
@@ -402,6 +418,102 @@ app.post('/asaas/criar-parcela', async (req, res) => {
         console.error('[Asaas Boleto] Erro status:', err.response?.status);
         console.error('[Asaas Boleto] Erro data:', JSON.stringify(err.response?.data));
         console.error('[Asaas Boleto] Erro msg:', err.message);
+        res.status(500).json({ error: err.message, details: err.response?.data });
+    }
+});
+// ============================================================
+// ROTA 8 — Criar CARNÊ NATIVO no Asaas (parcelamento único, múltiplos boletos por folha)
+// Chamado UMA VEZ por venda — Asaas agrupa e gera carnê PDF com 3 boletos por folha A4
+// ============================================================
+app.post('/asaas/criar-carne', async (req, res) => {
+    try {
+        const {
+            asaasToken, asaasAmbiente,
+            clientName, cpf, phone, email,
+            saleId, installmentCount, installmentValue, firstDueDate, description
+        } = req.body;
+
+        if (!asaasToken)       return res.status(400).json({ error: 'asaasToken obrigatório' });
+        if (!saleId)           return res.status(400).json({ error: 'saleId obrigatório' });
+        if (!installmentCount) return res.status(400).json({ error: 'installmentCount obrigatório' });
+        if (!installmentValue) return res.status(400).json({ error: 'installmentValue obrigatório' });
+        if (!firstDueDate)     return res.status(400).json({ error: 'firstDueDate obrigatório' });
+
+        const base = asaasAmbiente === 'producao'
+            ? 'https://api.asaas.com/v3'
+            : 'https://sandbox.asaas.com/api/v3';
+
+        const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
+
+        // 1. Busca ou cria cliente
+        let customerId = null;
+        if (cpf) {
+            const cpfLimpo = cpf.replace(/\D/g, '');
+            try {
+                const buscaRes = await axios.get(`${base}/customers?cpfCnpj=${cpfLimpo}&limit=1`, { headers });
+                if (buscaRes.data.data?.length > 0) {
+                    customerId = buscaRes.data.data[0].id;
+                    console.log('[Asaas Carnê] Cliente encontrado:', customerId);
+                }
+            } catch(e) { console.warn('[Asaas Carnê] Erro ao buscar cliente:', e.response?.data); }
+        }
+        if (!customerId) {
+            const payload = { name: clientName || 'Cliente' };
+            if (cpf)   payload.cpfCnpj    = cpf.replace(/\D/g, '');
+            if (email) payload.email       = email;
+            if (phone) payload.mobilePhone = phone.replace(/\D/g, '');
+            const criarRes = await axios.post(`${base}/customers`, payload, { headers });
+            customerId = criarRes.data.id;
+            console.log('[Asaas Carnê] Cliente criado:', customerId);
+        }
+
+        // 2. Cria parcelamento nativo — Asaas gera todos os boletos agrupados
+        const pagamentoRes = await axios.post(`${base}/payments`, {
+            customer:          customerId,
+            billingType:       'BOLETO',
+            dueDate:           firstDueDate,
+            description:       description || `Carnê ${installmentCount}x - ${clientName}`,
+            externalReference: saleId,
+            installmentCount:  Number(installmentCount),
+            installmentValue:  Number(installmentValue)
+        }, { headers });
+
+        const installmentGroupId = pagamentoRes.data.installment;
+        console.log('[Asaas Carnê] Parcelamento criado, installmentId:', installmentGroupId);
+
+        // 3. Busca todas as parcelas do grupo para obter IDs e URLs individuais
+        const pagamentosRes = await axios.get(
+            `${base}/payments?installment=${installmentGroupId}&limit=100`,
+            { headers }
+        );
+        const pagamentos = (pagamentosRes.data.data || [])
+            .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+
+        const payments = pagamentos.map((p, i) => ({
+            number:    i + 1,
+            paymentId: p.id,
+            boletoUrl: p.bankSlipUrl || null,
+            dueDate:   p.dueDate,
+            status:    p.status
+        }));
+
+        // 4. Tenta obter URL do carnê PDF (múltiplos boletos por folha)
+        let paymentBookUrl = null;
+        try {
+            const bookRes = await axios.get(
+                `${base}/installments/${installmentGroupId}/paymentBook`,
+                { headers }
+            );
+            paymentBookUrl = bookRes.data?.bankSlipUrl || bookRes.data?.url || null;
+            console.log('[Asaas Carnê] paymentBookUrl:', paymentBookUrl);
+        } catch(e) {
+            console.warn('[Asaas Carnê] paymentBook indisponível, usando boletos individuais. Status:', e.response?.status);
+        }
+
+        res.json({ installmentId: installmentGroupId, paymentBookUrl, payments });
+    } catch (err) {
+        console.error('[Asaas Carnê] Erro status:', err.response?.status);
+        console.error('[Asaas Carnê] Erro data:', JSON.stringify(err.response?.data));
         res.status(500).json({ error: err.message, details: err.response?.data });
     }
 });
