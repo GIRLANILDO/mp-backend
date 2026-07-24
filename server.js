@@ -200,10 +200,9 @@ app.post('/webhook', async (req, res) => {
     }
 });
 // ============================================================
-// ROTA 5 — Criar pagamento Pix de PARCELA (Asaas)
+// ROTA 5 — Criar pagamento Pix de PARCELA (Asaas) — legado
 // ============================================================
 const ASAAS_BASE = process.env.ASAAS_BASE_URL || 'https://api.asaas.com/api/v3';
-
 async function obterOuCriarClienteAsaas(apiKey, payerName, payerCpfCnpj, payerEmail) {
     const headers = { 'access_token': apiKey, 'Content-Type': 'application/json' };
     console.log('[Asaas] Base URL:', ASAAS_BASE);
@@ -229,7 +228,6 @@ async function obterOuCriarClienteAsaas(apiKey, payerName, payerCpfCnpj, payerEm
     console.log('[Asaas] Cliente criado:', res.data.id);
     return res.data.id;
 }
-
 app.post('/criar-parcela-asaas', async (req, res) => {
     try {
         const { asaasApiKey, installmentId, amount, dueDate, description, payerName, payerCpfCnpj, payerEmail } = req.body;
@@ -237,12 +235,9 @@ app.post('/criar-parcela-asaas', async (req, res) => {
         if (!installmentId) return res.status(400).json({ error: 'installmentId obrigatório' });
         if (!amount)        return res.status(400).json({ error: 'amount obrigatório' });
         if (!dueDate)       return res.status(400).json({ error: 'dueDate obrigatório' });
-
         const headers = { 'access_token': asaasApiKey, 'Content-Type': 'application/json' };
-
         // 1. Obtém/cria cliente no Asaas
         const customerId = await obterOuCriarClienteAsaas(asaasApiKey, payerName, payerCpfCnpj, payerEmail);
-
         // 2. Cria cobrança PIX
         console.log('[Asaas] Criando pagamento para cliente:', customerId, 'valor:', amount, 'venc:', dueDate);
         const pagamentoRes = await axios.post(`${ASAAS_BASE}/payments`, {
@@ -255,13 +250,11 @@ app.post('/criar-parcela-asaas', async (req, res) => {
         }, { headers });
         const pagamento = pagamentoRes.data;
         console.log('[Asaas] Pagamento criado:', pagamento.id, 'status:', pagamento.status);
-
         // 3. Busca QR Code
         console.log('[Asaas] Buscando QR Code para pagamento:', pagamento.id);
         const qrRes = await axios.get(`${ASAAS_BASE}/payments/${pagamento.id}/pixQrCode`, { headers });
         const qrData = qrRes.data;
         console.log('[Asaas] QR Code obtido, encodedImage length:', qrData.encodedImage?.length);
-
         res.json({
             paymentId:     pagamento.id,
             qrCodeBase64:  qrData.encodedImage,
@@ -306,26 +299,110 @@ app.post('/webhook/asaas', async (req, res) => {
         }
         const data = snap.data();
         if (data.pago === true) return;
+        // Detecta se foi boleto ou PIX
+        const formaPagamento = payment.billingType === 'BOLETO'
+            ? 'Boleto (automático)'
+            : 'PIX (automático)';
         const hoje = new Date().toISOString();
         await docRef.update({
             pago: true,
             status: 'pago',
             paymentDate: hoje,
-            paymentMethod: 'PIX',
+            paymentMethod: payment.billingType === 'BOLETO' ? 'BOLETO' : 'PIX',
             dataPagamento: hoje,
-            meioPagamento: 'PIX (automático)',
+            meioPagamento: formaPagamento,
             asaasPaymentId: payment.id
         });
         await db.collection('notificacoes').add({
             ownerId:   data.ownerId,
             titulo:    'Pagamento Recebido!',
-            mensagem:  `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via PIX (Asaas)`,
+            mensagem:  `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via ${formaPagamento}`,
             lida:      false,
             timestamp: new Date()
         });
-        console.log(`✅ Baixa automática Asaas: parcela ${installmentId} (paymentId: ${payment.id})`);
+        console.log(`✅ Baixa automática Asaas: parcela ${installmentId} (${formaPagamento}, paymentId: ${payment.id})`);
     } catch (err) {
         console.error('Erro no webhook Asaas:', err.response?.data || err.message);
+    }
+});
+// ============================================================
+// ROTA 7 — Criar BOLETO BANCÁRIO de PARCELA (Asaas)
+// Chamado pelo frontend quando metodoQrCode === 'asaas'
+// ============================================================
+app.post('/asaas/criar-parcela', async (req, res) => {
+    try {
+        const {
+            asaasToken, asaasAmbiente,
+            clientName, cpf, phone, email,
+            installmentId, amount, dueDate, description
+        } = req.body;
+
+        if (!asaasToken)    return res.status(400).json({ error: 'asaasToken obrigatório' });
+        if (!installmentId) return res.status(400).json({ error: 'installmentId obrigatório' });
+        if (!amount)        return res.status(400).json({ error: 'amount obrigatório' });
+        if (!dueDate)       return res.status(400).json({ error: 'dueDate obrigatório' });
+
+        // Base URL conforme ambiente escolhido nas configurações da ótica
+        const base = asaasAmbiente === 'producao'
+            ? 'https://api.asaas.com/v3'
+            : 'https://sandbox.asaas.com/api/v3';
+
+        const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
+
+        // 1. Busca cliente pelo CPF, ou cria se não existir
+        let customerId = null;
+        if (cpf) {
+            const cpfLimpo = cpf.replace(/\D/g, '');
+            try {
+                const buscaRes = await axios.get(
+                    `${base}/customers?cpfCnpj=${cpfLimpo}&limit=1`,
+                    { headers }
+                );
+                if (buscaRes.data.data && buscaRes.data.data.length > 0) {
+                    customerId = buscaRes.data.data[0].id;
+                    console.log('[Asaas Boleto] Cliente encontrado:', customerId);
+                }
+            } catch(e) {
+                console.warn('[Asaas Boleto] Erro ao buscar cliente:', e.response?.status, JSON.stringify(e.response?.data));
+            }
+        }
+
+        if (!customerId) {
+            const payload = { name: clientName || 'Cliente' };
+            if (cpf)   payload.cpfCnpj = cpf.replace(/\D/g, '');
+            if (email) payload.email   = email;
+            if (phone) payload.mobilePhone = phone.replace(/\D/g, '');
+            const criarRes = await axios.post(`${base}/customers`, payload, { headers });
+            customerId = criarRes.data.id;
+            console.log('[Asaas Boleto] Cliente criado:', customerId);
+        }
+
+        // 2. Cria boleto bancário
+        const pagamentoRes = await axios.post(`${base}/payments`, {
+            customer:          customerId,
+            billingType:       'BOLETO',
+            value:             Number(amount),
+            dueDate:           dueDate,
+            description:       description || `Parcela ${installmentId}`,
+            externalReference: installmentId
+        }, { headers });
+
+        const pagamento = pagamentoRes.data;
+        console.log('[Asaas Boleto] Boleto criado:', pagamento.id, '| status:', pagamento.status);
+        console.log('[Asaas Boleto] bankSlipUrl:', pagamento.bankSlipUrl);
+
+        res.json({
+            paymentId:  pagamento.id,
+            boletoUrl:  pagamento.bankSlipUrl || null,
+            invoiceUrl: pagamento.invoiceUrl  || null,
+            pixQrCode:  pagamento.pixQrCode   || null,
+            status:     pagamento.status
+        });
+    } catch (err) {
+        console.error('[Asaas Boleto] Erro status:', err.response?.status);
+        console.error('[Asaas Boleto] Erro data:', JSON.stringify(err.response?.data));
+        console.error('[Asaas Boleto] Erro msg:', err.message);
+        res.status(500).json({ error: err.message, details: err.response?.data });
     }
 });
 // ============================================================
