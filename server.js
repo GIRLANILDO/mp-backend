@@ -407,6 +407,7 @@ app.post('/asaas/criar-parcela', async (req, res) => {
 });
 // ============================================================
 // VERIFICAÇÃO AUTOMÁTICA — a cada 5 minutos confere parcelas pendentes
+// Cobre tanto Mercado Pago (PIX) quanto Asaas (Boleto e PIX)
 // ============================================================
 const verificarParcelasPendentes = async () => {
     try {
@@ -417,44 +418,98 @@ const verificarParcelasPendentes = async () => {
             .get();
         if (snapshot.empty) return;
         let baixasFeitas = 0;
+
+        // Cache de settings por ownerId para não buscar repetidamente
+        const settingsCache = {};
+        const getSettings = async (ownerId) => {
+            if (settingsCache[ownerId]) return settingsCache[ownerId];
+            const doc = await db.collection('settings').doc(ownerId).get();
+            const data = doc.exists ? doc.data() : {};
+            settingsCache[ownerId] = data;
+            return data;
+        };
+
         for (const doc of snapshot.docs) {
             const data = doc.data();
-            const mpPaymentId = data.mpPaymentId;
-            if (!mpPaymentId || mpPaymentId === 'null') continue;
             const ownerId = data.ownerId;
             if (!ownerId) continue;
-            try {
-                const settingsDoc = await db.collection('settings').doc(ownerId).get();
-                if (!settingsDoc.exists) continue;
-                const mpToken = settingsDoc.data()?.mpAccessToken;
-                if (!mpToken) continue;
-                const statusRes = await axios.get(
-                    `https://api.mercadopago.com/v1/payments/${mpPaymentId}`,
-                    { headers: { Authorization: `Bearer ${mpToken}` } }
-                );
-                if (statusRes.data.status !== 'approved') continue;
-                const hoje = new Date().toISOString();
-                await doc.ref.update({
-                    pago: true,
-                    status: 'pago',
-                    paymentDate: hoje,
-                    paymentMethod: 'PIX',
-                    dataPagamento: hoje,
-                    meioPagamento: 'PIX (automático)'
-                });
-                await db.collection('notificacoes').add({
-                    ownerId: ownerId,
-                    titulo: 'Pagamento Recebido!',
-                    mensagem: `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via PIX`,
-                    lida: false,
-                    timestamp: new Date()
-                });
-                baixasFeitas++;
-                console.log(`✅ Baixa automática (verificação): parcela ${doc.id} (paymentId: ${mpPaymentId})`);
-            } catch (e) {
-                continue;
+
+            // ── Verificação Mercado Pago ──────────────────────────
+            const mpPaymentId = data.mpPaymentId;
+            if (mpPaymentId && mpPaymentId !== 'null') {
+                try {
+                    const settings = await getSettings(ownerId);
+                    const mpToken = settings?.mpAccessToken;
+                    if (mpToken) {
+                        const statusRes = await axios.get(
+                            `https://api.mercadopago.com/v1/payments/${mpPaymentId}`,
+                            { headers: { Authorization: `Bearer ${mpToken}` } }
+                        );
+                        if (statusRes.data.status === 'approved') {
+                            const hoje = new Date().toISOString();
+                            await doc.ref.update({
+                                pago: true, status: 'pago',
+                                paymentDate: hoje, paymentMethod: 'PIX',
+                                dataPagamento: hoje, meioPagamento: 'PIX (automático)'
+                            });
+                            await db.collection('notificacoes').add({
+                                ownerId, titulo: 'Pagamento Recebido!',
+                                mensagem: `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via PIX`,
+                                lida: false, timestamp: new Date()
+                            });
+                            baixasFeitas++;
+                            console.log(`✅ Baixa MP: parcela ${doc.id} (paymentId: ${mpPaymentId})`);
+                            continue; // já deu baixa, pula para a próxima parcela
+                        }
+                    }
+                } catch (e) { /* segue para verificar Asaas */ }
+            }
+
+            // ── Verificação Asaas (Boleto ou PIX) ────────────────
+            const asaasPaymentId = data.asaasPaymentId;
+            if (asaasPaymentId && asaasPaymentId !== 'null') {
+                try {
+                    const settings = await getSettings(ownerId);
+                    const asaasToken = settings?.asaasToken;
+                    if (!asaasToken) continue;
+
+                    const asaasAmbiente = settings?.asaasAmbiente || 'sandbox';
+                    const base = asaasAmbiente === 'producao'
+                        ? 'https://api.asaas.com/v3'
+                        : 'https://sandbox.asaas.com/api/v3';
+
+                    const statusRes = await axios.get(
+                        `${base}/payments/${asaasPaymentId}`,
+                        { headers: { 'access_token': asaasToken } }
+                    );
+                    const pagamento = statusRes.data;
+                    const statusPago = ['RECEIVED', 'CONFIRMED', 'RECEIVED_IN_CASH'].includes(pagamento.status);
+                    if (!statusPago) continue;
+
+                    const forma = pagamento.billingType === 'BOLETO'
+                        ? 'Boleto (automático)'
+                        : 'PIX (automático)';
+                    const hoje = new Date().toISOString();
+                    await doc.ref.update({
+                        pago: true, status: 'pago',
+                        paymentDate: hoje,
+                        paymentMethod: pagamento.billingType === 'BOLETO' ? 'BOLETO' : 'PIX',
+                        dataPagamento: hoje,
+                        meioPagamento: forma
+                    });
+                    await db.collection('notificacoes').add({
+                        ownerId, titulo: 'Pagamento Recebido!',
+                        mensagem: `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} ${forma}`,
+                        lida: false, timestamp: new Date()
+                    });
+                    baixasFeitas++;
+                    console.log(`✅ Baixa Asaas: parcela ${doc.id} (${forma}, paymentId: ${asaasPaymentId})`);
+                } catch (e) {
+                    console.warn(`⚠️ Erro ao verificar Asaas para parcela ${doc.id}:`, e.response?.data || e.message);
+                }
             }
         }
+
         if (baixasFeitas > 0) {
             console.log(`✅ Verificação concluída: ${baixasFeitas} baixa(s) feita(s)`);
         }
