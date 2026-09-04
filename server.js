@@ -554,6 +554,56 @@ app.get('/asaas/carne/:saleId', async (req, res) => {
     }
 });
 // ============================================================
+// ROTA 10 — Cancelar PAGAMENTO INDIVIDUAL no Asaas
+// Chamado quando uma venda parcelada é excluída do sistema
+// ============================================================
+app.post('/asaas/cancelar-pagamento', async (req, res) => {
+    try {
+        const { asaasToken, asaasAmbiente, paymentId } = req.body;
+        if (!asaasToken) return res.status(400).json({ error: 'asaasToken obrigatório' });
+        if (!paymentId)  return res.status(400).json({ error: 'paymentId obrigatório' });
+
+        const base = asaasAmbiente === 'producao'
+            ? 'https://api.asaas.com/v3'
+            : 'https://sandbox.asaas.com/api/v3';
+
+        const r = await axios.post(
+            `${base}/payments/${paymentId}/cancel`, {},
+            { headers: { 'access_token': asaasToken, 'Content-Type': 'application/json' } }
+        );
+        console.log(`[Asaas] Pagamento ${paymentId} cancelado. Status: ${r.data.status}`);
+        res.json(r.data);
+    } catch (err) {
+        console.error('[Asaas] Erro ao cancelar pagamento:', err.response?.status, JSON.stringify(err.response?.data));
+        res.status(err.response?.status || 500).json({ error: err.message, details: err.response?.data });
+    }
+});
+// ============================================================
+// ROTA 11 — Cancelar CARNÊ INTEIRO no Asaas
+// Chamado quando uma venda com carnê Asaas é excluída do sistema
+// ============================================================
+app.post('/asaas/cancelar-carne', async (req, res) => {
+    try {
+        const { asaasToken, asaasAmbiente, installmentId } = req.body;
+        if (!asaasToken)    return res.status(400).json({ error: 'asaasToken obrigatório' });
+        if (!installmentId) return res.status(400).json({ error: 'installmentId obrigatório' });
+
+        const base = asaasAmbiente === 'producao'
+            ? 'https://api.asaas.com/v3'
+            : 'https://sandbox.asaas.com/api/v3';
+
+        const r = await axios.post(
+            `${base}/installments/${installmentId}/cancel`, {},
+            { headers: { 'access_token': asaasToken, 'Content-Type': 'application/json' } }
+        );
+        console.log(`[Asaas] Carnê ${installmentId} cancelado.`);
+        res.json(r.data);
+    } catch (err) {
+        console.error('[Asaas] Erro ao cancelar carnê:', err.response?.status, JSON.stringify(err.response?.data));
+        res.status(err.response?.status || 500).json({ error: err.message, details: err.response?.data });
+    }
+});
+// ============================================================
 // VERIFICAÇÃO AUTOMÁTICA — a cada 5 minutos confere parcelas pendentes
 // Cobre tanto Mercado Pago (PIX) quanto Asaas (Boleto e PIX)
 // ============================================================
