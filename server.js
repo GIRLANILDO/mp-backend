@@ -8,7 +8,8 @@ app.use(express.json());
 // FIREBASE ADMIN SDK
 // ============================================================
 const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { getMessaging } = require('firebase-admin/messaging');   // ← FCM
 const serviceAccount = {
     type: "service_account",
     project_id: "sisvenda-775d9",
@@ -21,6 +22,62 @@ const serviceAccount = {
 };
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
+
+// ============================================================
+// HELPER — Envia push notification FCM para todos os dispositivos do dono
+// ============================================================
+async function enviarPushNotification(ownerId, titulo, mensagem) {
+    try {
+        const settingsDoc = await db.collection('settings').doc(ownerId).get();
+        if (!settingsDoc.exists) return;
+        const tokens = settingsDoc.data()?.fcmTokens || [];
+        if (tokens.length === 0) return;
+
+        const messaging = getMessaging();
+        const tokensInvalidos = [];
+
+        await Promise.all(tokens.map(async (token) => {
+            try {
+                await messaging.send({
+                    token,
+                    notification: { title: titulo, body: mensagem },
+                    webpush: {
+                        notification: {
+                            icon: '/icon-192.png',
+                            badge: '/icon-192.png',
+                            vibrate: [200, 100, 200],
+                            requireInteraction: true
+                        },
+                        fcmOptions: { link: '/' }
+                    }
+                });
+            } catch (err) {
+                // Token expirado ou inválido — marca para remover
+                if (
+                    err.code === 'messaging/invalid-registration-token' ||
+                    err.code === 'messaging/registration-token-not-registered'
+                ) {
+                    tokensInvalidos.push(token);
+                } else {
+                    console.warn('Erro FCM para token:', err.message);
+                }
+            }
+        }));
+
+        // Remove tokens inválidos automaticamente
+        if (tokensInvalidos.length > 0) {
+            await db.collection('settings').doc(ownerId).update({
+                fcmTokens: FieldValue.arrayRemove(...tokensInvalidos)
+            });
+            console.log(`🗑️ ${tokensInvalidos.length} token(s) FCM inválido(s) removido(s) de ${ownerId}`);
+        }
+
+        console.log(`📲 Push enviado para ${tokens.length - tokensInvalidos.length} dispositivo(s) de ${ownerId}: "${titulo}"`);
+    } catch (err) {
+        console.error('Erro ao enviar push notification:', err.message);
+    }
+}
+
 // ============================================================
 // MERCADO PAGO
 // ============================================================
@@ -188,13 +245,16 @@ app.post('/webhook', async (req, res) => {
             meioPagamento: 'PIX (automático)'
         });
         console.log(`✅ Baixa automática: parcela ${docRef.id} paga via MP (paymentId: ${paymentId})`);
+        const mensagemPush = `Parcela ${docData.number}/${docData.total} de ${docData.clientName} — R$ ${parseFloat(docData.amount).toFixed(2).replace('.', ',')} pago via PIX`;
         await db.collection('notificacoes').add({
             ownerId: ownerId,
             titulo: 'Pagamento Recebido!',
-            mensagem: `Parcela ${docData.number}/${docData.total} de ${docData.clientName} — R$ ${parseFloat(docData.amount).toFixed(2).replace('.', ',')} pago via PIX`,
+            mensagem: mensagemPush,
             lida: false,
             timestamp: new Date()
         });
+        // ← Push notification para o celular mesmo com o sistema fechado
+        await enviarPushNotification(ownerId, '💰 Pagamento Recebido!', mensagemPush);
     } catch (err) {
         console.error('Erro no webhook:', err.response?.data || err.message);
     }
@@ -236,9 +296,7 @@ app.post('/criar-parcela-asaas', async (req, res) => {
         if (!amount)        return res.status(400).json({ error: 'amount obrigatório' });
         if (!dueDate)       return res.status(400).json({ error: 'dueDate obrigatório' });
         const headers = { 'access_token': asaasApiKey, 'Content-Type': 'application/json' };
-        // 1. Obtém/cria cliente no Asaas
         const customerId = await obterOuCriarClienteAsaas(asaasApiKey, payerName, payerCpfCnpj, payerEmail);
-        // 2. Cria cobrança PIX
         console.log('[Asaas] Criando pagamento para cliente:', customerId, 'valor:', amount, 'venc:', dueDate);
         const pagamentoRes = await axios.post(`${ASAAS_BASE}/payments`, {
             customer:          customerId,
@@ -250,7 +308,6 @@ app.post('/criar-parcela-asaas', async (req, res) => {
         }, { headers });
         const pagamento = pagamentoRes.data;
         console.log('[Asaas] Pagamento criado:', pagamento.id, 'status:', pagamento.status);
-        // 3. Busca QR Code
         console.log('[Asaas] Buscando QR Code para pagamento:', pagamento.id);
         const qrRes = await axios.get(`${ASAAS_BASE}/payments/${pagamento.id}/pixQrCode`, { headers });
         const qrData = qrRes.data;
@@ -270,8 +327,6 @@ app.post('/criar-parcela-asaas', async (req, res) => {
 });
 // ============================================================
 // ROTA 6 — Webhook do Asaas
-// URL: https://intuitive-surprise-production-8572.up.railway.app/webhook/asaas
-// Eventos: PAYMENT_RECEIVED, PAYMENT_CONFIRMED
 // ============================================================
 app.post('/webhook/asaas', async (req, res) => {
     res.sendStatus(200);
@@ -286,12 +341,8 @@ app.post('/webhook/asaas', async (req, res) => {
         }
         const { event, payment } = req.body;
         if (!['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'].includes(event) || !payment) return;
-        // Tenta encontrar a parcela de duas formas:
-        // 1) fluxo antigo: externalReference = installmentId (doc ID no Firebase)
-        // 2) fluxo novo (carnê nativo): externalReference = saleId → busca por asaasPaymentId
         let docRef = null;
         let data   = null;
-
         const externalRef = payment.externalReference;
         if (externalRef) {
             const directSnap = await db.collection('installments').doc(externalRef).get();
@@ -315,7 +366,6 @@ app.post('/webhook/asaas', async (req, res) => {
             return;
         }
         if (data.pago === true) return;
-        // Detecta se foi boleto ou PIX
         const formaPagamento = payment.billingType === 'BOLETO'
             ? 'Boleto (automático)'
             : 'PIX (automático)';
@@ -329,21 +379,23 @@ app.post('/webhook/asaas', async (req, res) => {
             meioPagamento: formaPagamento,
             asaasPaymentId: payment.id
         });
+        const mensagemPush = `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via ${formaPagamento}`;
         await db.collection('notificacoes').add({
             ownerId:   data.ownerId,
             titulo:    'Pagamento Recebido!',
-            mensagem:  `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via ${formaPagamento}`,
+            mensagem:  mensagemPush,
             lida:      false,
             timestamp: new Date()
         });
-        console.log(`✅ Baixa automática Asaas: parcela ${installmentId} (${formaPagamento}, paymentId: ${payment.id})`);
+        // ← Push notification para o celular mesmo com o sistema fechado
+        await enviarPushNotification(data.ownerId, '💰 Pagamento Recebido!', mensagemPush);
+        console.log(`✅ Baixa automática Asaas: parcela ${docRef.id} (${formaPagamento}, paymentId: ${payment.id})`);
     } catch (err) {
         console.error('Erro no webhook Asaas:', err.response?.data || err.message);
     }
 });
 // ============================================================
 // ROTA 7 — Criar BOLETO BANCÁRIO de PARCELA (Asaas)
-// Chamado pelo frontend quando metodoQrCode === 'asaas'
 // ============================================================
 app.post('/asaas/criar-parcela', async (req, res) => {
     try {
@@ -358,14 +410,12 @@ app.post('/asaas/criar-parcela', async (req, res) => {
         if (!amount)        return res.status(400).json({ error: 'amount obrigatório' });
         if (!dueDate)       return res.status(400).json({ error: 'dueDate obrigatório' });
 
-        // Base URL conforme ambiente escolhido nas configurações da ótica
         const base = asaasAmbiente === 'producao'
             ? 'https://api.asaas.com/v3'
             : 'https://sandbox.asaas.com/api/v3';
 
         const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
 
-        // 1. Busca cliente pelo CPF, ou cria se não existir
         let customerId = null;
         if (cpf) {
             const cpfLimpo = cpf.replace(/\D/g, '');
@@ -393,7 +443,6 @@ app.post('/asaas/criar-parcela', async (req, res) => {
             console.log('[Asaas Boleto] Cliente criado:', customerId);
         }
 
-        // 2. Cria boleto bancário
         const pagamentoRes = await axios.post(`${base}/payments`, {
             customer:          customerId,
             billingType:       'BOLETO',
@@ -405,7 +454,6 @@ app.post('/asaas/criar-parcela', async (req, res) => {
 
         const pagamento = pagamentoRes.data;
         console.log('[Asaas Boleto] Boleto criado:', pagamento.id, '| status:', pagamento.status);
-        console.log('[Asaas Boleto] bankSlipUrl:', pagamento.bankSlipUrl);
 
         res.json({
             paymentId:  pagamento.id,
@@ -422,8 +470,7 @@ app.post('/asaas/criar-parcela', async (req, res) => {
     }
 });
 // ============================================================
-// ROTA 8 — Criar CARNÊ NATIVO no Asaas (parcelamento único, múltiplos boletos por folha)
-// Chamado UMA VEZ por venda — Asaas agrupa e gera carnê PDF com 3 boletos por folha A4
+// ROTA 8 — Criar CARNÊ NATIVO no Asaas
 // ============================================================
 app.post('/asaas/criar-carne', async (req, res) => {
     try {
@@ -445,7 +492,6 @@ app.post('/asaas/criar-carne', async (req, res) => {
 
         const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
 
-        // 1. Busca ou cria cliente
         let customerId = null;
         if (cpf) {
             const cpfLimpo = cpf.replace(/\D/g, '');
@@ -467,7 +513,6 @@ app.post('/asaas/criar-carne', async (req, res) => {
             console.log('[Asaas Carnê] Cliente criado:', customerId);
         }
 
-        // 2. Cria parcelamento nativo — Asaas gera todos os boletos agrupados
         const pagamentoRes = await axios.post(`${base}/payments`, {
             customer:          customerId,
             billingType:       'BOLETO',
@@ -481,7 +526,6 @@ app.post('/asaas/criar-carne', async (req, res) => {
         const installmentGroupId = pagamentoRes.data.installment;
         console.log('[Asaas Carnê] Parcelamento criado, installmentId:', installmentGroupId);
 
-        // 3. Busca todas as parcelas do grupo para obter IDs e URLs individuais
         const pagamentosRes = await axios.get(
             `${base}/payments?installment=${installmentGroupId}&limit=100`,
             { headers }
@@ -497,8 +541,6 @@ app.post('/asaas/criar-carne', async (req, res) => {
             status:    p.status
         }));
 
-        // paymentBookUrl é servido via rota proxy GET /asaas/carne/:saleId
-        // (o endpoint do Asaas retorna PDF binário, não URL — por isso usamos o proxy)
         res.json({ installmentId: installmentGroupId, payments });
     } catch (err) {
         console.error('[Asaas Carnê] Erro status:', err.response?.status);
@@ -507,46 +549,34 @@ app.post('/asaas/criar-carne', async (req, res) => {
     }
 });
 // ============================================================
-// ROTA 9 — Proxy: serve o PDF do carnê Asaas (3 boletos por folha A4)
-// GET /asaas/carne/:saleId
-// O Asaas retorna o carnê como PDF binário — esta rota faz o pipe direto para o navegador
+// ROTA 9 — Proxy: serve o PDF do carnê Asaas
 // ============================================================
 app.get('/asaas/carne/:saleId', async (req, res) => {
     try {
         const { saleId } = req.params;
-
-        // Busca a venda para obter ownerId e asaasInstallmentId
         const saleDoc = await db.collection('sales').doc(saleId).get();
         if (!saleDoc.exists) return res.status(404).json({ error: 'Venda não encontrada' });
         const sale = saleDoc.data();
         const ownerId       = sale.ownerId || sale.userId;
         const installmentId = sale.asaasInstallmentId;
         if (!installmentId) return res.status(404).json({ error: 'Carnê Asaas não gerado para esta venda' });
-
-        // Busca token e ambiente nas configurações da loja
         const settingsDoc = await db.collection('settings').doc(ownerId).get();
         if (!settingsDoc.exists) return res.status(404).json({ error: 'Configurações não encontradas' });
         const settings      = settingsDoc.data();
         const asaasToken    = settings?.asaasToken;
         const asaasAmbiente = settings?.asaasAmbiente || 'sandbox';
         if (!asaasToken) return res.status(400).json({ error: 'Token Asaas não configurado' });
-
         const base = asaasAmbiente === 'producao'
             ? 'https://api.asaas.com/v3'
             : 'https://sandbox.asaas.com/api/v3';
-
         console.log(`[Asaas Carnê PDF] Buscando carnê para venda ${saleId}, installmentId ${installmentId}`);
-
-        // Faz pipe do PDF binário retornado pelo Asaas diretamente para o navegador
         const pdfRes = await axios.get(
             `${base}/installments/${installmentId}/paymentBook`,
             { headers: { 'access_token': asaasToken }, responseType: 'stream' }
         );
-
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="carne-${saleId}.pdf"`);
         pdfRes.data.pipe(res);
-
         console.log(`[Asaas Carnê PDF] PDF enviado para venda ${saleId}`);
     } catch (err) {
         console.error('[Asaas Carnê PDF] Erro:', err.response?.status, err.message);
@@ -555,18 +585,15 @@ app.get('/asaas/carne/:saleId', async (req, res) => {
 });
 // ============================================================
 // ROTA 10 — Cancelar PAGAMENTO INDIVIDUAL no Asaas
-// Chamado quando uma venda parcelada é excluída do sistema
 // ============================================================
 app.post('/asaas/cancelar-pagamento', async (req, res) => {
     try {
         const { asaasToken, asaasAmbiente, paymentId } = req.body;
         if (!asaasToken) return res.status(400).json({ error: 'asaasToken obrigatório' });
         if (!paymentId)  return res.status(400).json({ error: 'paymentId obrigatório' });
-
         const base = asaasAmbiente === 'producao'
             ? 'https://api.asaas.com/v3'
             : 'https://sandbox.asaas.com/api/v3';
-
         const r = await axios.post(
             `${base}/payments/${paymentId}/cancel`, {},
             { headers: { 'access_token': asaasToken, 'Content-Type': 'application/json' } }
@@ -580,18 +607,15 @@ app.post('/asaas/cancelar-pagamento', async (req, res) => {
 });
 // ============================================================
 // ROTA 11 — Cancelar CARNÊ INTEIRO no Asaas
-// Chamado quando uma venda com carnê Asaas é excluída do sistema
 // ============================================================
 app.post('/asaas/cancelar-carne', async (req, res) => {
     try {
         const { asaasToken, asaasAmbiente, installmentId } = req.body;
         if (!asaasToken)    return res.status(400).json({ error: 'asaasToken obrigatório' });
         if (!installmentId) return res.status(400).json({ error: 'installmentId obrigatório' });
-
         const base = asaasAmbiente === 'producao'
             ? 'https://api.asaas.com/v3'
             : 'https://sandbox.asaas.com/api/v3';
-
         const r = await axios.post(
             `${base}/installments/${installmentId}/cancel`, {},
             { headers: { 'access_token': asaasToken, 'Content-Type': 'application/json' } }
@@ -605,7 +629,6 @@ app.post('/asaas/cancelar-carne', async (req, res) => {
 });
 // ============================================================
 // VERIFICAÇÃO AUTOMÁTICA — a cada 5 minutos confere parcelas pendentes
-// Cobre tanto Mercado Pago (PIX) quanto Asaas (Boleto e PIX)
 // ============================================================
 const verificarParcelasPendentes = async () => {
     try {
@@ -617,7 +640,6 @@ const verificarParcelasPendentes = async () => {
         if (snapshot.empty) return;
         let baixasFeitas = 0;
 
-        // Cache de settings por ownerId para não buscar repetidamente
         const settingsCache = {};
         const getSettings = async (ownerId) => {
             if (settingsCache[ownerId]) return settingsCache[ownerId];
@@ -632,7 +654,7 @@ const verificarParcelasPendentes = async () => {
             const ownerId = data.ownerId;
             if (!ownerId) continue;
 
-            // ── Verificação Mercado Pago ──────────────────────────
+            // ── Verificação Mercado Pago ──
             const mpPaymentId = data.mpPaymentId;
             if (mpPaymentId && mpPaymentId !== 'null') {
                 try {
@@ -650,32 +672,33 @@ const verificarParcelasPendentes = async () => {
                                 paymentDate: hoje, paymentMethod: 'PIX',
                                 dataPagamento: hoje, meioPagamento: 'PIX (automático)'
                             });
+                            const mensagemPush = `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via PIX`;
                             await db.collection('notificacoes').add({
                                 ownerId, titulo: 'Pagamento Recebido!',
-                                mensagem: `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} pago via PIX`,
+                                mensagem: mensagemPush,
                                 lida: false, timestamp: new Date()
                             });
+                            // ← Push notification
+                            await enviarPushNotification(ownerId, '💰 Pagamento Recebido!', mensagemPush);
                             baixasFeitas++;
                             console.log(`✅ Baixa MP: parcela ${doc.id} (paymentId: ${mpPaymentId})`);
-                            continue; // já deu baixa, pula para a próxima parcela
+                            continue;
                         }
                     }
                 } catch (e) { /* segue para verificar Asaas */ }
             }
 
-            // ── Verificação Asaas (Boleto ou PIX) ────────────────
+            // ── Verificação Asaas ──
             const asaasPaymentId = data.asaasPaymentId;
             if (asaasPaymentId && asaasPaymentId !== 'null') {
                 try {
                     const settings = await getSettings(ownerId);
                     const asaasToken = settings?.asaasToken;
                     if (!asaasToken) continue;
-
                     const asaasAmbiente = settings?.asaasAmbiente || 'sandbox';
                     const base = asaasAmbiente === 'producao'
                         ? 'https://api.asaas.com/v3'
                         : 'https://sandbox.asaas.com/api/v3';
-
                     const statusRes = await axios.get(
                         `${base}/payments/${asaasPaymentId}`,
                         { headers: { 'access_token': asaasToken } }
@@ -683,7 +706,6 @@ const verificarParcelasPendentes = async () => {
                     const pagamento = statusRes.data;
                     const statusPago = ['RECEIVED', 'CONFIRMED', 'RECEIVED_IN_CASH'].includes(pagamento.status);
                     if (!statusPago) continue;
-
                     const forma = pagamento.billingType === 'BOLETO'
                         ? 'Boleto (automático)'
                         : 'PIX (automático)';
@@ -695,11 +717,14 @@ const verificarParcelasPendentes = async () => {
                         dataPagamento: hoje,
                         meioPagamento: forma
                     });
+                    const mensagemPush = `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} ${forma}`;
                     await db.collection('notificacoes').add({
                         ownerId, titulo: 'Pagamento Recebido!',
-                        mensagem: `Parcela ${data.number}/${data.total} de ${data.clientName} — R$ ${parseFloat(data.amount).toFixed(2).replace('.', ',')} ${forma}`,
+                        mensagem: mensagemPush,
                         lida: false, timestamp: new Date()
                     });
+                    // ← Push notification
+                    await enviarPushNotification(ownerId, '💰 Pagamento Recebido!', mensagemPush);
                     baixasFeitas++;
                     console.log(`✅ Baixa Asaas: parcela ${doc.id} (${forma}, paymentId: ${asaasPaymentId})`);
                 } catch (e) {
