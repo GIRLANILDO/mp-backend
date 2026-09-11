@@ -743,5 +743,18 @@ const verificarParcelasPendentes = async () => {
 setInterval(verificarParcelasPendentes, 5 * 60 * 1000);
 setTimeout(verificarParcelasPendentes, 10000);
 // ============================================================
+// ROTA 12 — Push manual (baixa manual no frontend)
+// ============================================================
+app.post('/enviar-push', async (req, res) => {
+    res.sendStatus(200);
+    try {
+        const { ownerId, titulo, mensagem } = req.body;
+        if (!ownerId || !titulo) return;
+        await enviarPushNotification(ownerId, titulo, mensagem || '');
+    } catch(err) {
+        console.error('Erro /enviar-push:', err.message);
+    }
+});
+// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor rodando na porta ' + PORT));
