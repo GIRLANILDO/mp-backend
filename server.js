@@ -752,23 +752,58 @@ app.post('/enviar-push', async (req, res) => {
 // Base URL: https://craam.api.crabr.com.br
 // Autenticação: Basic Auth (usuário:senha do site CRA21)
 // ============================================================
-const CRA21_API = 'https://craam.api.crabr.com.br';
+// ── Endpoints CRA21 por estado (padrão: cra{uf}.api.crabr.com.br)
+//    AM confirmado em produção. Outros estados seguem o mesmo padrão do portal crabr.com.br.
+//    Se um estado não estiver aqui ou o endpoint estiver errado, o usuário pode informar
+//    a URL manualmente no campo "URL CRA21" nas configurações.
+const CRA21_ENDPOINTS = {
+    AC: 'https://craac.api.crabr.com.br',
+    AL: 'https://craal.api.crabr.com.br',
+    AM: 'https://craam.api.crabr.com.br',  // ← confirmado
+    AP: 'https://craap.api.crabr.com.br',
+    BA: 'https://craba.api.crabr.com.br',
+    CE: 'https://crace.api.crabr.com.br',
+    DF: 'https://cradf.api.crabr.com.br',
+    ES: 'https://craes.api.crabr.com.br',
+    GO: 'https://crago.api.crabr.com.br',
+    MA: 'https://crama.api.crabr.com.br',
+    MG: 'https://cramg.api.crabr.com.br',
+    MS: 'https://crams.api.crabr.com.br',
+    MT: 'https://cramt.api.crabr.com.br',
+    PA: 'https://crapa.api.crabr.com.br',
+    PB: 'https://crapb.api.crabr.com.br',
+    PE: 'https://crape.api.crabr.com.br',
+    PI: 'https://crapi.api.crabr.com.br',
+    PR: 'https://crapr.api.crabr.com.br',
+    RJ: 'https://crarj.api.crabr.com.br',
+    RN: 'https://crarn.api.crabr.com.br',
+    RO: 'https://craro.api.crabr.com.br',
+    RR: 'https://crarr.api.crabr.com.br',
+    RS: 'https://crars.api.crabr.com.br',
+    SC: 'https://crasc.api.crabr.com.br',
+    SE: 'https://crase.api.crabr.com.br',
+    SP: 'https://crasp.api.crabr.com.br',
+    TO: 'https://crato.api.crabr.com.br',
+};
 
-// ── CORREÇÃO: lê credenciais CRA21 + campos auxiliares (codApres, comarca)
-//    O front-end salva codApres/comarca na RAIZ do documento ownerConfigs,
-//    fora do objeto cra21. Esta função unifica tudo num único objeto retornado.
 async function getCra21Creds(ownerId) {
     const snap = await db.collection('ownerConfigs').doc(ownerId).get();
     if (!snap.exists) throw new Error('ownerConfigs não encontrado para ' + ownerId);
     const d = snap.data();
     if (!d.cra21 || !d.cra21.usuario || !d.cra21.senha)
         throw new Error('Credenciais CRA21 não configuradas. Configure em Protesto → ⚙️ Configurar CRA21.');
+    // Estado: raiz > dentro de cra21 > padrão AM
+    const estado = d.estado || d.cra21.estado || 'AM';
+    // URL: campo manual tem prioridade, depois lookup automático pelo estado
+    const urlManual = d.cra21UrlOverride || d.cra21.urlOverride || '';
+    const baseUrl   = urlManual || CRA21_ENDPOINTS[estado] || CRA21_ENDPOINTS['AM'];
     return {
         ...d.cra21,
-        // codApres e comarca podem estar na raiz OU dentro de d.cra21 — busca nos dois
         codApres:   d.cra21.codApres   || d.codApres   || '',
         idCartorio: d.cra21.idCartorio || d.idCartorio || '',
         comarca:    d.cra21.comarca    || d.comarca    || '',
+        estado,
+        baseUrl,
     };
 }
 
@@ -782,7 +817,8 @@ app.post('/cra21/testar', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        const r = await axios.get(`${CRA21_API}/titulo`, {
+        console.log(`[CRA21] Testando credenciais — estado: ${creds.estado} | endpoint: ${creds.baseUrl}`);
+        const r = await axios.get(`${creds.baseUrl}/titulo`, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
         });
@@ -797,19 +833,19 @@ app.post('/cra21/testar', async (req, res) => {
 
 // ROTA 14 — Consultar títulos protestados no CRA21
 app.post('/cra21/consultar', async (req, res) => {
-    const { ownerId, codApres: codApresOverride, idCartorio: idCartorioOverride } = req.body;
+    const { ownerId, codApres: codApresOverride, idCartorio: idCartorioOverride, situacao: situacaoFiltro } = req.body;
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        // Aceita override do body (front-end ou diagnóstico) ou usa o do Firestore (via getCra21Creds)
         const codApres   = codApresOverride   || creds.codApres;
         const idCartorio = idCartorioOverride || creds.idCartorio;
         // Monta parâmetros para /titulo
         const params = new URLSearchParams();
-        if (idCartorio) params.set('idCartorio', idCartorio);
-        if (codApres)   params.set('idApresentante', codApres);
+        if (idCartorio)    params.set('idCartorio', idCartorio);
+        if (codApres)      params.set('idApresentante', codApres);
+        if (situacaoFiltro) params.set('situacao', situacaoFiltro); // ex: 'PAGO', 'PROTESTADO'
         const qs = params.toString();
-        const url = `${CRA21_API}/titulo${qs ? '?' + qs : ''}`;
+        const url = `${creds.baseUrl}/titulo${qs ? '?' + qs : ''}`;
         console.log(`[CRA21] Consultando: ${url}`);
         const r = await axios.get(url, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
@@ -840,7 +876,7 @@ app.post('/cra21/cartorios', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        const r = await axios.get(`${CRA21_API}/cartorio`, {
+        const r = await axios.get(`${creds.baseUrl}/cartorio`, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
         });
@@ -877,7 +913,7 @@ app.post('/cra21/enviar-remessa', async (req, res) => {
             NOSSO_NUMERO:     t.numeroTitulo,
             COMARCA:          t.comarca
         }));
-        const r = await axios.post(`${CRA21_API}/remessa`, payload, {
+        const r = await axios.post(`${creds.baseUrl}/remessa`, payload, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
             validateStatus: () => true
         });
@@ -900,7 +936,7 @@ app.post('/cra21/cancelar', async (req, res) => {
             NUMERO_TITULO: t.numeroTitulo,
             COMARCA:       t.comarca
         }));
-        const r = await axios.post(`${CRA21_API}/cancelamento`, payload, {
+        const r = await axios.post(`${creds.baseUrl}/cancelamento`, payload, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
             validateStatus: () => true
         });
