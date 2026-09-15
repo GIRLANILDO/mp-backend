@@ -792,13 +792,12 @@ app.post('/cra21/consultar', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        // Monta parâmetros para /url/titulo
-        // idCartorio 1301209 = 1º Ofício de Coari/AM
-        const cartorio = idCartorio || creds.idCartorio || '1301209';
-        const params = new URLSearchParams({ idCartorio: cartorio });
-        // idApresentante filtra pelos títulos da empresa (codApres salvo nas credenciais)
-        if (creds.codApres) params.set('idApresentante', creds.codApres);
-        const url = `${CRA21_API}/url/titulo?${params.toString()}`;
+        // Monta parâmetros para /url/titulo (sem idCartorio — usa ID interno do CRA21)
+        const params = new URLSearchParams();
+        if (creds.idCartorio) params.set('idCartorio', creds.idCartorio);
+        if (creds.codApres)   params.set('idApresentante', creds.codApres);
+        const qs = params.toString();
+        const url = `${CRA21_API}/url/titulo${qs ? '?' + qs : ''}`;
         console.log(`[CRA21] Consultando: ${url}`);
         const r = await axios.get(url, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
@@ -814,6 +813,23 @@ app.post('/cra21/consultar', async (req, res) => {
         const total = data?.total_items ?? titulos.length;
         console.log(`[CRA21] Consulta retornou ${total} título(s) para ${ownerId}`);
         res.json({ ok: true, total, titulos, _raw: data, _status: r.status });
+    } catch (e) {
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ROTA 14b — Listar cartórios disponíveis no CRA21 (diagnóstico)
+app.post('/cra21/cartorios', async (req, res) => {
+    const { ownerId } = req.body;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const r = await axios.get(`${CRA21_API}/url/cartorio`, {
+            headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
+            validateStatus: () => true
+        });
+        console.log(`[CRA21] /url/cartorio status: ${r.status} | chaves: ${r.data ? Object.keys(r.data).join(',') : 'null'}`);
+        res.json({ ok: true, status: r.status, data: r.data });
     } catch (e) {
         res.json({ ok: false, erro: e.message });
     }
