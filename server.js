@@ -792,23 +792,19 @@ app.post('/cra21/consultar', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        // Período padrão: últimos 10 anos até hoje
-        const hoje = new Date();
-        const fmt = d => `${String(d.getDate()).padStart(2,'0')}${String(d.getMonth()+1).padStart(2,'0')}${d.getFullYear()}`;
-        const dFim   = dataFinal   || fmt(hoje);
-        const dIni   = dataInicial || fmt(new Date(hoje.getFullYear()-10, hoje.getMonth(), hoje.getDate()));
-        // Monta parâmetros — idApresentante filtra pelos títulos da empresa
-        const params = new URLSearchParams({ dataInicial: dIni, dataFinal: dFim });
+        // Monta parâmetros para /url/titulo
         // idCartorio 1301209 = 1º Ofício de Coari/AM
         const cartorio = idCartorio || creds.idCartorio || '1301209';
-        params.set('idCartorio', cartorio);
-        // idApresentante = código do apresentante (ex: 130120)
+        const params = new URLSearchParams({ idCartorio: cartorio });
+        // idApresentante filtra pelos títulos da empresa (codApres salvo nas credenciais)
         if (creds.codApres) params.set('idApresentante', creds.codApres);
-        console.log(`[CRA21] Consultando: ${CRA21_API}/url/titulo?${params.toString()}`);
-        const r = await axios.get(`${CRA21_API}/url/titulo?${params.toString()}`, {
+        const url = `${CRA21_API}/url/titulo?${params.toString()}`;
+        console.log(`[CRA21] Consultando: ${url}`);
+        const r = await axios.get(url, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
         });
+        console.log(`[CRA21] Status: ${r.status} | Tipo: ${typeof r.data} | Chaves: ${r.data ? Object.keys(r.data).join(',') : 'null'}`);
         const data = r.data;
         // A API CRA21 retorna formato HAL: { _embedded: { titulo: [...] }, total_items: N }
         const titulos = Array.isArray(data) ? data :
@@ -817,7 +813,7 @@ app.post('/cra21/consultar', async (req, res) => {
                         Array.isArray(data?.data) ? data.data : [];
         const total = data?.total_items ?? titulos.length;
         console.log(`[CRA21] Consulta retornou ${total} título(s) para ${ownerId}`);
-        res.json({ ok: true, total, titulos, _raw: data });
+        res.json({ ok: true, total, titulos, _raw: data, _status: r.status });
     } catch (e) {
         res.json({ ok: false, erro: e.message });
     }
