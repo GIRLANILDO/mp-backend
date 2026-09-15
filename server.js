@@ -52,7 +52,6 @@ async function enviarPushNotification(ownerId, titulo, mensagem) {
                     }
                 });
             } catch (err) {
-                // Token expirado ou inválido — marca para remover
                 if (
                     err.code === 'messaging/invalid-registration-token' ||
                     err.code === 'messaging/registration-token-not-registered'
@@ -64,7 +63,6 @@ async function enviarPushNotification(ownerId, titulo, mensagem) {
             }
         }));
 
-        // Remove tokens inválidos automaticamente
         if (tokensInvalidos.length > 0) {
             await db.collection('settings').doc(ownerId).update({
                 fcmTokens: FieldValue.arrayRemove(...tokensInvalidos)
@@ -253,7 +251,6 @@ app.post('/webhook', async (req, res) => {
             lida: false,
             timestamp: new Date()
         });
-        // ← Push notification para o celular mesmo com o sistema fechado
         await enviarPushNotification(ownerId, '💰 Pagamento Recebido!', mensagemPush);
     } catch (err) {
         console.error('Erro no webhook:', err.response?.data || err.message);
@@ -387,7 +384,6 @@ app.post('/webhook/asaas', async (req, res) => {
             lida:      false,
             timestamp: new Date()
         });
-        // ← Push notification para o celular mesmo com o sistema fechado
         await enviarPushNotification(data.ownerId, '💰 Pagamento Recebido!', mensagemPush);
         console.log(`✅ Baixa automática Asaas: parcela ${docRef.id} (${formaPagamento}, paymentId: ${payment.id})`);
     } catch (err) {
@@ -654,7 +650,6 @@ const verificarParcelasPendentes = async () => {
             const ownerId = data.ownerId;
             if (!ownerId) continue;
 
-            // ── Verificação Mercado Pago ──
             const mpPaymentId = data.mpPaymentId;
             if (mpPaymentId && mpPaymentId !== 'null') {
                 try {
@@ -678,7 +673,6 @@ const verificarParcelasPendentes = async () => {
                                 mensagem: mensagemPush,
                                 lida: false, timestamp: new Date()
                             });
-                            // ← Push notification
                             await enviarPushNotification(ownerId, '💰 Pagamento Recebido!', mensagemPush);
                             baixasFeitas++;
                             console.log(`✅ Baixa MP: parcela ${doc.id} (paymentId: ${mpPaymentId})`);
@@ -688,7 +682,6 @@ const verificarParcelasPendentes = async () => {
                 } catch (e) { /* segue para verificar Asaas */ }
             }
 
-            // ── Verificação Asaas ──
             const asaasPaymentId = data.asaasPaymentId;
             if (asaasPaymentId && asaasPaymentId !== 'null') {
                 try {
@@ -723,7 +716,6 @@ const verificarParcelasPendentes = async () => {
                         mensagem: mensagemPush,
                         lida: false, timestamp: new Date()
                     });
-                    // ← Push notification
                     await enviarPushNotification(ownerId, '💰 Pagamento Recebido!', mensagemPush);
                     baixasFeitas++;
                     console.log(`✅ Baixa Asaas: parcela ${doc.id} (${forma}, paymentId: ${asaasPaymentId})`);
@@ -753,6 +745,127 @@ app.post('/enviar-push', async (req, res) => {
         await enviarPushNotification(ownerId, titulo, mensagem || '');
     } catch(err) {
         console.error('Erro /enviar-push:', err.message);
+    }
+});
+// ============================================================
+// ROTAS CRA21 — Cartório de Protesto
+// Base URL: https://crama.api.crabr.com.br
+// Autenticação: Basic Auth (usuário:senha do site CRA21)
+// ============================================================
+const CRA21_API = 'https://crama.api.crabr.com.br';
+
+async function getCra21Creds(ownerId) {
+    const snap = await db.collection('ownerConfigs').doc(ownerId).get();
+    if (!snap.exists) throw new Error('ownerConfigs não encontrado para ' + ownerId);
+    const d = snap.data();
+    if (!d.cra21 || !d.cra21.usuario || !d.cra21.senha)
+        throw new Error('Credenciais CRA21 não configuradas. Configure em Protesto → ⚙️ Configurar CRA21.');
+    return d.cra21;
+}
+
+function basicAuth(usuario, senha) {
+    return 'Basic ' + Buffer.from(`${usuario}:${senha}`).toString('base64');
+}
+
+// ROTA 13 — Testar credenciais CRA21
+app.post('/cra21/testar', async (req, res) => {
+    const { ownerId } = req.body;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const r = await axios.get(`${CRA21_API}/url/titulo`, {
+            headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
+            validateStatus: () => true
+        });
+        if (r.status === 401) return res.json({ ok: false, erro: 'Usuário ou senha incorretos.' });
+        if (r.status === 403) return res.json({ ok: false, erro: 'Acesso negado pelo CRA21.' });
+        console.log(`[CRA21] Teste de credenciais OK para ${ownerId}, status ${r.status}`);
+        res.json({ ok: true, status: r.status });
+    } catch (e) {
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ROTA 14 — Consultar títulos protestados no CRA21
+app.post('/cra21/consultar', async (req, res) => {
+    const { ownerId, comarca } = req.body;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const params = comarca ? `?comarca=${encodeURIComponent(comarca.toUpperCase())}` : '';
+        const r = await axios.get(`${CRA21_API}/url/titulo${params}`, {
+            headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
+            validateStatus: () => true
+        });
+        const data = r.data;
+        const titulos = Array.isArray(data) ? data :
+                        Array.isArray(data?.titulos) ? data.titulos :
+                        Array.isArray(data?.data) ? data.data : [];
+        console.log(`[CRA21] Consulta retornou ${titulos.length} título(s) para ${ownerId}`);
+        res.json({ ok: true, total: titulos.length, titulos, _raw: data });
+    } catch (e) {
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ROTA 15 — Enviar remessa de protesto ao CRA21
+app.post('/cra21/enviar-remessa', async (req, res) => {
+    const { ownerId, titulos } = req.body;
+    if (!ownerId || !Array.isArray(titulos) || !titulos.length)
+        return res.json({ ok: false, erro: 'ownerId e titulos[] obrigatórios' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const payload = titulos.map(t => ({
+            NOME_DEVEDOR:     t.nomeDevedor,
+            CPF_CNPJ_DEVEDOR: t.cpfCnpj,
+            LOGRADOURO:       t.logradouro,
+            NUMERO:           t.numero,
+            COMPLEMENTO:      '',
+            BAIRRO:           t.bairro,
+            CEP:              t.cep,
+            MUNICIPIO:        t.municipio,
+            UF:               t.uf,
+            NUMERO_TITULO:    t.numeroTitulo,
+            ESPECIE:          t.especie,
+            DATA_EMISSAO:     t.dataEmissao,
+            DATA_VENCIMENTO:  t.dataVencimento,
+            VALOR:            t.valor,
+            SALDO:            t.valor,
+            NOSSO_NUMERO:     t.numeroTitulo,
+            COMARCA:          t.comarca
+        }));
+        const r = await axios.post(`${CRA21_API}/url/remessa`, payload, {
+            headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
+            validateStatus: () => true
+        });
+        if (r.status >= 400) return res.json({ ok: false, erro: `CRA21 retornou ${r.status}`, data: r.data });
+        console.log(`[CRA21] Remessa enviada: ${titulos.length} título(s) para ${ownerId}`);
+        res.json({ ok: true, data: r.data });
+    } catch (e) {
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ROTA 16 — Solicitar cancelamento de protesto no CRA21
+app.post('/cra21/cancelar', async (req, res) => {
+    const { ownerId, titulos } = req.body;
+    if (!ownerId || !Array.isArray(titulos) || !titulos.length)
+        return res.json({ ok: false, erro: 'ownerId e titulos[] obrigatórios' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const payload = titulos.map(t => ({
+            NUMERO_TITULO: t.numeroTitulo,
+            COMARCA:       t.comarca
+        }));
+        const r = await axios.post(`${CRA21_API}/url/cancelamento`, payload, {
+            headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
+            validateStatus: () => true
+        });
+        if (r.status >= 400) return res.json({ ok: false, erro: `CRA21 retornou ${r.status}`, data: r.data });
+        console.log(`[CRA21] Cancelamento enviado: ${titulos.length} título(s) para ${ownerId}`);
+        res.json({ ok: true, data: r.data });
+    } catch (e) {
+        res.json({ ok: false, erro: e.message });
     }
 });
 // ============================================================
