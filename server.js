@@ -752,7 +752,7 @@ app.post('/enviar-push', async (req, res) => {
 // Base URL: https://crama.api.crabr.com.br
 // Autenticação: Basic Auth (usuário:senha do site CRA21)
 // ============================================================
-const CRA21_API = 'https://crama.api.crabr.com.br';
+const CRA21_API = 'https://craam.api.crabr.com.br';
 
 async function getCra21Creds(ownerId) {
     const snap = await db.collection('ownerConfigs').doc(ownerId).get();
@@ -788,12 +788,19 @@ app.post('/cra21/testar', async (req, res) => {
 
 // ROTA 14 — Consultar títulos protestados no CRA21
 app.post('/cra21/consultar', async (req, res) => {
-    const { ownerId, comarca } = req.body;
+    const { ownerId, idCartorio, dataInicial, dataFinal } = req.body;
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        const params = comarca ? `?comarca=${encodeURIComponent(comarca.toUpperCase())}` : '';
-        const r = await axios.get(`${CRA21_API}/url/titulo${params}`, {
+        // Período padrão: últimos 10 anos até hoje
+        const hoje = new Date();
+        const fmt = d => `${String(d.getDate()).padStart(2,'0')}${String(d.getMonth()+1).padStart(2,'0')}${d.getFullYear()}`;
+        const dFim   = dataFinal   || fmt(hoje);
+        const dIni   = dataInicial || fmt(new Date(hoje.getFullYear()-10, hoje.getMonth(), hoje.getDate()));
+        // idCartorio 1301209 = 1º Ofício de Coari/AM
+        const cartorio = idCartorio || creds.idCartorio || '1301209';
+        const params = new URLSearchParams({ dataInicial: dIni, dataFinal: dFim, idCartorio: cartorio });
+        const r = await axios.get(`${CRA21_API}/url/titulo?${params.toString()}`, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
         });
