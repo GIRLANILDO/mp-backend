@@ -843,7 +843,13 @@ app.post('/cra21/consultar', async (req, res) => {
         const params = new URLSearchParams();
         if (idCartorio)    params.set('idCartorio', idCartorio);
         if (codApres)      params.set('idApresentante', codApres);
-        if (situacaoFiltro) params.set('situacao', situacaoFiltro); // ex: 'PAGO', 'PROTESTADO'
+        // O CRA21 usa "situacao" para status do título e "ocorrencia" para coluna "Ocorrência"
+        // Exemplos: PROTESTADO, RETORNADO, DEVOLVIDO, PAGO, PROTESTO CANCELADO
+        if (situacaoFiltro) {
+            params.set('situacao', situacaoFiltro);
+            // Tenta também como ocorrencia (CRA21 coluna "Ocorrência")
+            params.set('ocorrencia', situacaoFiltro);
+        }
         const qs = params.toString();
         const url = `${creds.baseUrl}/titulo${qs ? '?' + qs : ''}`;
         console.log(`[CRA21] Consultando: ${url}`);
