@@ -773,7 +773,7 @@ app.post('/cra21/testar', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        const r = await axios.get(`${CRA21_API}/url/titulo`, {
+        const r = await axios.get(`${CRA21_API}/titulo`, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
         });
@@ -792,12 +792,12 @@ app.post('/cra21/consultar', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        // Monta parâmetros para /url/titulo (sem idCartorio — usa ID interno do CRA21)
+        // Monta parâmetros para /titulo (sem idCartorio — usa ID interno do CRA21)
         const params = new URLSearchParams();
         if (creds.idCartorio) params.set('idCartorio', creds.idCartorio);
         if (creds.codApres)   params.set('idApresentante', creds.codApres);
         const qs = params.toString();
-        const url = `${CRA21_API}/url/titulo${qs ? '?' + qs : ''}`;
+        const url = `${CRA21_API}/titulo${qs ? '?' + qs : ''}`;
         console.log(`[CRA21] Consultando: ${url}`);
         const r = await axios.get(url, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
@@ -824,11 +824,11 @@ app.post('/cra21/cartorios', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        const r = await axios.get(`${CRA21_API}/url/cartorio`, {
+        const r = await axios.get(`${CRA21_API}/cartorio`, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
         });
-        console.log(`[CRA21] /url/cartorio status: ${r.status} | chaves: ${r.data ? Object.keys(r.data).join(',') : 'null'}`);
+        console.log(`[CRA21] /cartorio status: ${r.status} | chaves: ${r.data ? Object.keys(r.data).join(',') : 'null'}`);
         res.json({ ok: true, status: r.status, data: r.data });
     } catch (e) {
         res.json({ ok: false, erro: e.message });
@@ -861,7 +861,7 @@ app.post('/cra21/enviar-remessa', async (req, res) => {
             NOSSO_NUMERO:     t.numeroTitulo,
             COMARCA:          t.comarca
         }));
-        const r = await axios.post(`${CRA21_API}/url/remessa`, payload, {
+        const r = await axios.post(`${CRA21_API}/remessa`, payload, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
             validateStatus: () => true
         });
@@ -884,7 +884,7 @@ app.post('/cra21/cancelar', async (req, res) => {
             NUMERO_TITULO: t.numeroTitulo,
             COMARCA:       t.comarca
         }));
-        const r = await axios.post(`${CRA21_API}/url/cancelamento`, payload, {
+        const r = await axios.post(`${CRA21_API}/cancelamento`, payload, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
             validateStatus: () => true
         });
