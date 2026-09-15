@@ -749,18 +749,27 @@ app.post('/enviar-push', async (req, res) => {
 });
 // ============================================================
 // ROTAS CRA21 — Cartório de Protesto
-// Base URL: https://crama.api.crabr.com.br
+// Base URL: https://craam.api.crabr.com.br
 // Autenticação: Basic Auth (usuário:senha do site CRA21)
 // ============================================================
 const CRA21_API = 'https://craam.api.crabr.com.br';
 
+// ── CORREÇÃO: lê credenciais CRA21 + campos auxiliares (codApres, comarca)
+//    O front-end salva codApres/comarca na RAIZ do documento ownerConfigs,
+//    fora do objeto cra21. Esta função unifica tudo num único objeto retornado.
 async function getCra21Creds(ownerId) {
     const snap = await db.collection('ownerConfigs').doc(ownerId).get();
     if (!snap.exists) throw new Error('ownerConfigs não encontrado para ' + ownerId);
     const d = snap.data();
     if (!d.cra21 || !d.cra21.usuario || !d.cra21.senha)
         throw new Error('Credenciais CRA21 não configuradas. Configure em Protesto → ⚙️ Configurar CRA21.');
-    return d.cra21;
+    return {
+        ...d.cra21,
+        // codApres e comarca podem estar na raiz OU dentro de d.cra21 — busca nos dois
+        codApres:   d.cra21.codApres   || d.codApres   || '',
+        idCartorio: d.cra21.idCartorio || d.idCartorio || '',
+        comarca:    d.cra21.comarca    || d.comarca    || '',
+    };
 }
 
 function basicAuth(usuario, senha) {
@@ -792,7 +801,7 @@ app.post('/cra21/consultar', async (req, res) => {
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        // Aceita override do body (para diagnóstico) ou usa o do Firestore
+        // Aceita override do body (front-end ou diagnóstico) ou usa o do Firestore (via getCra21Creds)
         const codApres   = codApresOverride   || creds.codApres;
         const idCartorio = idCartorioOverride || creds.idCartorio;
         // Monta parâmetros para /titulo
@@ -814,7 +823,7 @@ app.post('/cra21/consultar', async (req, res) => {
                         Array.isArray(data?.titulos) ? data.titulos :
                         Array.isArray(data?.data) ? data.data : [];
         const total = data?.total_items ?? titulos.length;
-        console.log(`[CRA21] Consulta retornou ${total} título(s) para ${ownerId}`);
+        console.log(`[CRA21] Consulta retornou ${total} título(s) para ${ownerId} (codApres=${codApres||'não informado'})`);
         res.json({ ok: true, total, titulos, _raw: data, _status: r.status });
     } catch (e) {
         res.json({ ok: false, erro: e.message });
