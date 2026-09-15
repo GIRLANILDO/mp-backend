@@ -788,14 +788,17 @@ app.post('/cra21/testar', async (req, res) => {
 
 // ROTA 14 — Consultar títulos protestados no CRA21
 app.post('/cra21/consultar', async (req, res) => {
-    const { ownerId, idCartorio, dataInicial, dataFinal } = req.body;
+    const { ownerId, codApres: codApresOverride, idCartorio: idCartorioOverride } = req.body;
     if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
     try {
         const creds = await getCra21Creds(ownerId);
-        // Monta parâmetros para /titulo (sem idCartorio — usa ID interno do CRA21)
+        // Aceita override do body (para diagnóstico) ou usa o do Firestore
+        const codApres   = codApresOverride   || creds.codApres;
+        const idCartorio = idCartorioOverride || creds.idCartorio;
+        // Monta parâmetros para /titulo
         const params = new URLSearchParams();
-        if (creds.idCartorio) params.set('idCartorio', creds.idCartorio);
-        if (creds.codApres)   params.set('idApresentante', creds.codApres);
+        if (idCartorio) params.set('idCartorio', idCartorio);
+        if (codApres)   params.set('idApresentante', codApres);
         const qs = params.toString();
         const url = `${CRA21_API}/titulo${qs ? '?' + qs : ''}`;
         console.log(`[CRA21] Consultando: ${url}`);
