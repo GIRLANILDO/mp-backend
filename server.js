@@ -797,9 +797,14 @@ app.post('/cra21/consultar', async (req, res) => {
         const fmt = d => `${String(d.getDate()).padStart(2,'0')}${String(d.getMonth()+1).padStart(2,'0')}${d.getFullYear()}`;
         const dFim   = dataFinal   || fmt(hoje);
         const dIni   = dataInicial || fmt(new Date(hoje.getFullYear()-10, hoje.getMonth(), hoje.getDate()));
+        // Monta parâmetros — idApresentante filtra pelos títulos da empresa
+        const params = new URLSearchParams({ dataInicial: dIni, dataFinal: dFim });
         // idCartorio 1301209 = 1º Ofício de Coari/AM
         const cartorio = idCartorio || creds.idCartorio || '1301209';
-        const params = new URLSearchParams({ dataInicial: dIni, dataFinal: dFim, idCartorio: cartorio });
+        params.set('idCartorio', cartorio);
+        // idApresentante = código do apresentante (ex: 130120)
+        if (creds.codApres) params.set('idApresentante', creds.codApres);
+        console.log(`[CRA21] Consultando: ${CRA21_API}/url/titulo?${params.toString()}`);
         const r = await axios.get(`${CRA21_API}/url/titulo?${params.toString()}`, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha) },
             validateStatus: () => true
