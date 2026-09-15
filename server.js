@@ -798,11 +798,14 @@ app.post('/cra21/consultar', async (req, res) => {
             validateStatus: () => true
         });
         const data = r.data;
+        // A API CRA21 retorna formato HAL: { _embedded: { titulo: [...] }, total_items: N }
         const titulos = Array.isArray(data) ? data :
+                        Array.isArray(data?._embedded?.titulo) ? data._embedded.titulo :
                         Array.isArray(data?.titulos) ? data.titulos :
                         Array.isArray(data?.data) ? data.data : [];
-        console.log(`[CRA21] Consulta retornou ${titulos.length} título(s) para ${ownerId}`);
-        res.json({ ok: true, total: titulos.length, titulos, _raw: data });
+        const total = data?.total_items ?? titulos.length;
+        console.log(`[CRA21] Consulta retornou ${total} título(s) para ${ownerId}`);
+        res.json({ ok: true, total, titulos, _raw: data });
     } catch (e) {
         res.json({ ok: false, erro: e.message });
     }
