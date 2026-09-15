@@ -824,6 +824,10 @@ app.post('/cra21/consultar', async (req, res) => {
                         Array.isArray(data?.data) ? data.data : [];
         const total = data?.total_items ?? titulos.length;
         console.log(`[CRA21] Consulta retornou ${total} título(s) para ${ownerId} (codApres=${codApres||'não informado'})`);
+        if (titulos.length > 0) {
+            console.log(`[CRA21] Campos do 1º título: ${Object.keys(titulos[0]).join(', ')}`);
+            console.log(`[CRA21] 1º título (raw):`, JSON.stringify(titulos[0]));
+        }
         res.json({ ok: true, total, titulos, _raw: data, _status: r.status });
     } catch (e) {
         res.json({ ok: false, erro: e.message });
