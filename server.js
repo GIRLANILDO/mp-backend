@@ -1230,57 +1230,48 @@ app.post('/cra21/upload-portal', async (req, res) => {
 
         console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
 
-        // ── Busca JS chave do Sis21/CRA para achar URL e campos do upload AJAX ──
-        // Os arquivos importantes são: Lib21Ajax.js (AJAX framework), CraVisaoPaginaAdm.js,
-        // cra.js, scripts.js — que ficam no final da lista de scripts da página.
+        // ── Busca SOMENTE os JS que podem ter a config do upload ──
+        // Ignoramos sislib21/* (CPF/CNPJ/AJAX helpers — confirmado sem upload).
+        // Focamos em: scripts.js, cra.js, CraVisaoPaginaAdm.js, CraApresentante*.js
         try {
-            // Prioridade: arquivos do sislib21 e cra/site/js customizados (não assets/libs)
-            const priorityPatterns = [
-                /Lib21Ajax/i, /CraVisaoPaginaAdm/i, /CraApresentante/i,
-                /\/cra\/site\/js\/(?!common\/(app|layout|mpb|dashboard))[^/]+\.js/,
-                /\/cra\/site\/js\/common\/cra\.js/,
-                /\/cra\/site\/js\/common\/scripts\.js/,
-                /\/cra\/site\/js\/scripts\.js/,
-                /sislib21\/site\/Lib21/,
-            ];
-            const allScriptSrcs2 = [];
-            const scriptRe2 = /src=["']([^"']+\.js[^"']*)["']/gi;
-            let sm3;
-            while ((sm3 = scriptRe2.exec(uploadPageHtml)) !== null) {
-                allScriptSrcs2.push(sm3[1]);
-            }
-            const priorityScripts = allScriptSrcs2.filter(src =>
-                priorityPatterns.some(p => p.test(src))
-            );
-            console.log(`[CRA21 Portal] Scripts prioritários: ${JSON.stringify(priorityScripts)}`);
-
             const baseUrl = `https://craam.crabr.com.br`;
-            for (const relSrc of priorityScripts.slice(0, 12)) {
+            const uploadKwStrict = ['fileupload', 'enviarRemessa', 'fileUpload', 'FormData', 'tipoFuncao'];
+
+            // Pega todos os src de scripts da página
+            const allScriptSrcs3 = [];
+            const scriptRe3 = /src=["']([^"']+\.js[^"']*)["']/gi;
+            let sm4;
+            while ((sm4 = scriptRe3.exec(uploadPageHtml)) !== null) allScriptSrcs3.push(sm4[1]);
+
+            // Filtra SOMENTE os arquivos de interesse (não sislib21, não libs genéricas)
+            const targetFiles = allScriptSrcs3.filter(src =>
+                /scripts\.js|cra\.js|CraVisaoPaginaAdm|CraApresentante/i.test(src) &&
+                !/sislib21|Lib21|jquery|maskedinput|ie-fix|Assinatura|Relogio|Relatorio|RestPki|GoogleAnalytics|Remarketing|quick-sidebar|Md5|AcessoLogin/i.test(src)
+            );
+            console.log(`[CRA21-JS] Arquivos alvo: ${JSON.stringify(targetFiles)}`);
+
+            for (const relSrc of targetFiles.slice(0, 6)) {
                 try {
-                    const fullUrl = relSrc.startsWith('http') ? relSrc
-                        : relSrc.startsWith('/') ? `${baseUrl}${relSrc}`
-                        : `${baseUrl}/craam/site/${relSrc.replace(/^(?:\.\.\/)+(?:cra[^/]+\/site\/|sislib21\/site\/)/, (m) => m.includes('sislib21') ? '../sislib21/site/' : '')}`;
-                    // Tenta URL direta baseada no path relativo
                     const cleanPath = relSrc.replace(/^\.\.\/\.\.\//, '/');
                     const tryUrl = `${baseUrl}${cleanPath}`;
-                    const jsR3 = await axios.get(tryUrl, {
+                    console.log(`[CRA21-JS] Buscando: ${tryUrl}`);
+                    const jsR = await axios.get(tryUrl, {
                         headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
-                        validateStatus: () => true, maxRedirects: 2, timeout: 10000
+                        validateStatus: () => true, maxRedirects: 2, timeout: 15000
                     });
-                    const jsC = String(jsR3.data);
-                    const uploadKw = ['fileupload', 'enviarRemessa', 'upload', 'remessa', 'fileUpload', 'FormData', 'appendFile', 'acao', 'tipoFuncao'];
-                    const matches = uploadKw.filter(kw => jsC.includes(kw));
-                    console.log(`[CRA21 Portal] JS ${relSrc.split('/').pop()} (${jsC.length}chars) keywords: [${matches.join(',')}]`);
-                    if (matches.length > 0) {
-                        console.log(`[CRA21 Portal] JS KEY content[0..5000]: ${jsC.slice(0, 5000)}`);
-                        if (jsC.length > 5000) console.log(`[CRA21 Portal] JS KEY content[5000..10000]: ${jsC.slice(5000, 10000)}`);
+                    const jsC = String(jsR.data);
+                    const hits = uploadKwStrict.filter(kw => jsC.includes(kw));
+                    console.log(`[CRA21-JS] ${relSrc.split('/').pop().split('?')[0]} status=${jsR.status} size=${jsC.length} hits=[${hits.join(',')}]`);
+                    // Sempre loga o conteúdo para scripts de interesse, em fatias de 3000
+                    for (let off = 0; off < Math.min(jsC.length, 15000); off += 3000) {
+                        console.log(`[CRA21-JS] CONTENT[${off}..${off+3000}]: ${jsC.slice(off, off+3000)}`);
                     }
                 } catch (e2) {
-                    console.log(`[CRA21 Portal] Erro ao buscar ${relSrc}: ${e2.message}`);
+                    console.log(`[CRA21-JS] ERRO ao buscar ${relSrc}: ${e2.message}`);
                 }
             }
         } catch (jsErr) {
-            console.log(`[CRA21 Portal] Erro ao buscar JS: ${jsErr.message}`);
+            console.log(`[CRA21-JS] Erro geral: ${jsErr.message}`);
         }
 
         // Monta multipart/form-data manualmente (sem dependência extra de npm)
