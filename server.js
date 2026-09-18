@@ -1291,36 +1291,32 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const mkField = (name, value) => Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
 
-        // ── POST para tipoFuncao=1 (action endpoint) ──
-        // O endpoint de ação do Sis21 pode precisar de NTISPOSTBACK=1 para saber
-        // que é um submit de form (não um GET de exibição). Enviamos apenas esse
-        // campo + o arquivo. NÃO enviamos login/senha/code — a sessão PHP é suficiente.
+        // ── POST estilo jQuery File Upload (AJAX para tipoFuncao=2) ──
+        // O Sis21 usa tipoFuncao=2 tanto para GET (display) quanto para POST AJAX (upload).
+        // O PHP diferencia pelo header X-Requested-With: XMLHttpRequest.
+        // tipoFuncao=1 retorna 500 (o handler de ação não suporta multipart).
+        // Enviamos APENAS o arquivo — sem login/senha/NTISPOSTBACK.
         const parts = [];
-        // NTISPOSTBACK=1: indica para o Sis21 que é um submit de formulário
-        parts.push(mkField('NTISPOSTBACK', '1'));
         // Arquivo
         parts.push(Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${nome}"\r\n` +
             `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'));
         parts.push(fileBuffer);
         parts.push(Buffer.from('\r\n', 'utf-8'));
-        // SEM botão submit — AJAX não inclui botões de submit
         parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
 
         const body = Buffer.concat(parts);
 
         console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | PHPSESSID: ${phpsessid.slice(0,8)}...`);
-
-        console.log(`[CRA21 Portal] POST URL (tipoFuncao=1/action): ${uploadPostUrl}`);
-        const uploadR = await axios.post(uploadPostUrl, body, {
+        console.log(`[CRA21 Portal] POST URL (tipoFuncao=2/display+AJAX): ${uploadUrl}`);
+        const uploadR = await axios.post(uploadUrl, body, {
             headers: {
                 'Content-Type': `multipart/form-data; boundary=${boundary}`,
                 'Content-Length': body.length,
                 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
                 'User-Agent': userAgent,
                 'Referer': uploadUrl,
-                // Header AJAX — jQuery File Upload sempre envia isso.
-                // O PHP usa para diferenciar AJAX de form submit tradicional.
+                // X-Requested-With faz o PHP entrar no handler AJAX (não valida form de login)
                 'X-Requested-With': 'XMLHttpRequest'
             },
             validateStatus: () => true,
