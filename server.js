@@ -1114,6 +1114,56 @@ async function cra21PortalLogin(usuario, senha, estado) {
     return { phpsessid, portalBase };
 }
 
+// ── Diagnóstico: retorna HTML completo da página de upload ──
+// GET /cra21/debug-upload-html?ownerId=xxx
+app.get('/cra21/debug-upload-html', async (req, res) => {
+    const ownerId = req.query.ownerId;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+
+        let phpsessid = creds.phpsessid || '';
+        if (!phpsessid) {
+            const r = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = r.phpsessid;
+        }
+
+        const UPLOAD_ACAO = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`;
+
+        const pageR = await axios.get(uploadUrl, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 3
+        });
+        const pageHtml = String(pageR.data);
+
+        // Extrai scripts inline que contenham fileupload/remessa
+        const inlineScripts = [];
+        const inlineRe = /<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+        let im;
+        while ((im = inlineRe.exec(pageHtml)) !== null) {
+            const c = im[1].trim();
+            if (c.length > 5) inlineScripts.push(c);
+        }
+
+        return res.json({
+            ok: true,
+            status: pageR.status,
+            htmlSize: pageHtml.length,
+            html: pageHtml,                    // HTML COMPLETO
+            inlineScripts,                     // todos os scripts inline
+            inlineScriptsWithUpload: inlineScripts.filter(s => /fileupload|remessa|upload/i.test(s))
+        });
+    } catch (e) {
+        return res.json({ ok: false, erro: e.message });
+    }
+});
+
 // ── Diagnóstico: retorna conteúdo dos JS chave do portal CRA21 ──
 // GET /cra21/debug-js?ownerId=xxx
 app.get('/cra21/debug-js', async (req, res) => {
@@ -1288,48 +1338,90 @@ app.post('/cra21/upload-portal', async (req, res) => {
           while ((m2 = re.exec(uploadPageHtml)) !== null) allScriptSrcList.push(m2[1]); }
         console.log(`[CRA21 Portal] Scripts incluídos: ${JSON.stringify(allScriptSrcList)}`);
 
-        // ── Busca URL do upload no JS específico da página ──
-        // O jQuery File Upload é configurado num JS como CraApresentanteUploadRemessa.js
-        // com algo como: $('#fileupload').fileupload({ url: '...', ... })
-        const pageSpecificSrcs = allScriptSrcList.filter(s =>
-            /CraApresentante|Remessa|Upload|cra\.js|CraVisaoPagina/i.test(s) &&
-            !/sislib21|Lib21|jquery|ie-fix|maskedinput|AcessoLogin|Assinatura|Relogio/i.test(s)
-        );
-        console.log(`[CRA21 Portal] JS específico da página: ${JSON.stringify(pageSpecificSrcs)}`);
+        // ── Busca URL do upload: 1) scripts inline, 2) JS externos específicos ──
+        // O jQuery File Upload é configurado com: $('#fileupload').fileupload({ url: '...' })
+        // Pode estar num <script> inline na página OU num JS externo específico.
+        // NOTA: cra.js tem fileupload para PoliticasDePrivacidade — filtrar essa URL.
 
         let discoveredUploadUrl = null;
         const baseUrlJs = `https://cra${uf}.crabr.com.br`;
-        for (const relSrc of pageSpecificSrcs.slice(0, 6)) {
-            let fullJsUrl;
-            if (relSrc.startsWith('http')) fullJsUrl = relSrc;
-            else if (relSrc.startsWith('/')) fullJsUrl = `${baseUrlJs}${relSrc}`;
-            else {
-                // relative from /craam/site/ — resolve ../../ prefix
-                const clean = relSrc.replace(/^(\.\.\/)+/, '/');
-                fullJsUrl = `${baseUrlJs}${clean}`;
+
+        // Helper: verifica se URL candidata é de upload de remessa (não política/privacidade)
+        const isUploadUrl = (url) =>
+            url && !/politica|privacy|cookie|acesso|login/i.test(url);
+
+        // ── 1) Busca em <script> INLINE da página ──
+        const inlineScriptRe = /<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+        let inlineM;
+        while ((inlineM = inlineScriptRe.exec(uploadPageHtml)) !== null) {
+            const cnt = inlineM[1];
+            if (!/fileupload|remessa|upload/i.test(cnt)) continue;
+            console.log(`[CRA21 Portal] Script inline relevante (fileupload/remessa): ${cnt.slice(0, 800)}`);
+            const m =
+                cnt.match(/fileupload\s*\(\s*\{[\s\S]{0,400}?url\s*:\s*["']([^"']+)["']/i) ||
+                cnt.match(/url\s*:\s*["']([^"']*admin\.php[^"']*)["']/i) ||
+                cnt.match(/(?:url|action)\s*:\s*["']([^"']*acao=[^"']+)["']/i);
+            if (m && isUploadUrl(m[1])) {
+                discoveredUploadUrl = m[1];
+                console.log(`[CRA21 Portal] ✓ URL encontrada em script inline: ${discoveredUploadUrl}`);
+                break;
             }
-            try {
-                const jsR2 = await axios.get(fullJsUrl, {
-                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
-                    validateStatus: () => true, timeout: 15000
-                });
-                const jsC2 = String(jsR2.data);
-                console.log(`[CRA21 Portal] JS ${relSrc.split('/').pop().split('?')[0]} size=${jsC2.length}`);
-                // Procura configuração do jQuery File Upload: url: '...'
-                const urlMatch2 =
-                    jsC2.match(/fileupload\s*\(\s*\{[\s\S]{0,300}?url\s*:\s*["']([^"']+)["']/i) ||
-                    jsC2.match(/url\s*:\s*["']([^"']*admin\.php[^"']*)["']/i) ||
-                    jsC2.match(/(?:url|action)\s*:\s*["']([^"']*acao=[^"']+)["']/i) ||
-                    jsC2.match(/\$\.ajax\s*\(\s*\{[\s\S]{0,300}?url\s*:\s*["']([^"']+)["']/i);
-                if (urlMatch2) {
-                    discoveredUploadUrl = urlMatch2[1];
-                    console.log(`[CRA21 Portal] ✓ URL de upload encontrada em ${relSrc.split('/').pop().split('?')[0]}: ${discoveredUploadUrl}`);
-                    break;
+        }
+
+        // ── 2) Busca em JS externos (filtra libs genéricas, prioriza específicos de remessa) ──
+        if (!discoveredUploadUrl) {
+            const pageSpecificSrcs = allScriptSrcList.filter(s =>
+                /CraApresentante|Remessa|Upload|CraVisaoPagina/i.test(s) &&
+                !/sislib21|Lib21|jquery|ie-fix|maskedinput|AcessoLogin|Assinatura|Relogio/i.test(s)
+            );
+            // Adiciona cra.js como fallback no final (tem fileupload mas pode ser URL errada)
+            const craJs = allScriptSrcList.find(s => /\/cra\.js/i.test(s));
+            if (craJs && !pageSpecificSrcs.includes(craJs)) pageSpecificSrcs.push(craJs);
+
+            console.log(`[CRA21 Portal] JS específico da página: ${JSON.stringify(pageSpecificSrcs)}`);
+
+            for (const relSrc of pageSpecificSrcs.slice(0, 8)) {
+                let fullJsUrl;
+                if (relSrc.startsWith('http')) fullJsUrl = relSrc;
+                else if (relSrc.startsWith('/')) fullJsUrl = `${baseUrlJs}${relSrc}`;
+                else {
+                    const clean = relSrc.replace(/^(\.\.\/)+/, '/');
+                    fullJsUrl = `${baseUrlJs}${clean}`;
                 }
-                // Se não achou pela regex, loga os primeiros 500 chars para inspeção manual
-                console.log(`[CRA21 Portal] JS snippet: ${jsC2.slice(0, 500)}`);
-            } catch (eJs) {
-                console.log(`[CRA21 Portal] Erro ao buscar JS ${relSrc}: ${eJs.message}`);
+                try {
+                    const jsR2 = await axios.get(fullJsUrl, {
+                        headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                        validateStatus: () => true, timeout: 15000
+                    });
+                    const jsC2 = String(jsR2.data);
+                    const jsName = relSrc.split('/').pop().split('?')[0];
+                    console.log(`[CRA21 Portal] JS ${jsName} size=${jsC2.length}`);
+
+                    // Procura TODAS as ocorrências de fileupload+url no JS e filtra política
+                    const allUrlMatches = [];
+                    const reFU = /fileupload\s*\(\s*\{[\s\S]{0,400}?url\s*:\s*["']([^"']+)["']/gi;
+                    let mFU;
+                    while ((mFU = reFU.exec(jsC2)) !== null) allUrlMatches.push(mFU[1]);
+                    const reAdmin = /url\s*:\s*["']([^"']*admin\.php[^"']*)["']/gi;
+                    let mA;
+                    while ((mA = reAdmin.exec(jsC2)) !== null) allUrlMatches.push(mA[1]);
+                    const reAcao = /(?:url|action)\s*:\s*["']([^"']*acao=[^"']+)["']/gi;
+                    let mAc;
+                    while ((mAc = reAcao.exec(jsC2)) !== null) allUrlMatches.push(mAc[1]);
+
+                    const validUrl = allUrlMatches.find(isUploadUrl);
+                    if (validUrl) {
+                        discoveredUploadUrl = validUrl;
+                        console.log(`[CRA21 Portal] ✓ URL de upload encontrada em ${jsName}: ${discoveredUploadUrl}`);
+                        break;
+                    } else if (allUrlMatches.length > 0) {
+                        console.log(`[CRA21 Portal] ${jsName}: URLs encontradas mas todas filtradas: ${JSON.stringify(allUrlMatches)}`);
+                    } else {
+                        console.log(`[CRA21 Portal] JS snippet ${jsName}: ${jsC2.slice(0, 400)}`);
+                    }
+                } catch (eJs) {
+                    console.log(`[CRA21 Portal] Erro ao buscar JS ${relSrc}: ${eJs.message}`);
+                }
             }
         }
 
