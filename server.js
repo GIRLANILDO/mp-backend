@@ -1471,7 +1471,77 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const submitName  = submitM ? submitM[1] : 'enviar';
         const submitValue = submitM ? submitM[2].trim() : 'Enviar';
 
-        console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
+        // ═══════════════════════════════════════════════════════════
+        // CRÍTICO: Extrai o action do formulário de upload da HTML
+        // O acao de exibição (tipoFuncao=2) é para GET.
+        // O <form action="..."> pode conter tipoFuncao=1 para processar.
+        // Usar a URL errada faz Sis21 chamar apresentar() em vez de processar().
+        // ═══════════════════════════════════════════════════════════
+        let formPostUrl = uploadUrl;  // fallback
+
+        // Tenta encontrar o <form> que contém o campo enviarRemessa e pegar seu action
+        const formHtmlM = uploadPageHtml.match(/<form(?:[^>]*)>([\s\S]{0,6000}?)<\/form>/gi) || [];
+        let uploadFormHtml = '';
+        for (const fh of formHtmlM) {
+            if (/enviarRemessa/i.test(fh)) { uploadFormHtml = fh; break; }
+        }
+        if (!uploadFormHtml) {
+            // Fallback: pega o form mais próximo antes de enviarRemessa
+            const idx = uploadPageHtml.indexOf('enviarRemessa');
+            if (idx >= 0) {
+                const before = uploadPageHtml.slice(Math.max(0, idx - 2000), idx);
+                const lastForm = before.lastIndexOf('<form');
+                if (lastForm >= 0) uploadFormHtml = before.slice(lastForm);
+            }
+        }
+
+        const formActionM = uploadFormHtml.match(/<form[^>]*\baction="([^"]+)"/i)
+                         || uploadPageHtml.match(/<form[^>]*\baction="([^"]*admin\.php[^"]+)"/i);
+        if (formActionM) {
+            const rawAction = formActionM[1].replace(/&amp;/g, '&');
+            if (rawAction.startsWith('http')) {
+                formPostUrl = rawAction;
+            } else if (rawAction.startsWith('/')) {
+                formPostUrl = `https://cra${uf}.crabr.com.br${rawAction}`;
+            } else {
+                // URL relativa — resolve a partir da base do portal
+                formPostUrl = `${portalBase}/${rawAction.replace(/^\.\.\//, '').replace(/^\.\//, '')}`;
+            }
+            console.log(`[CRA21 Portal] ✓ Form action extraído: ${formPostUrl.slice(0, 150)}`);
+        } else {
+            console.log(`[CRA21 Portal] ⚠ Form action NÃO encontrado — usando uploadUrl como fallback`);
+            // Loga o HTML em volta de enviarRemessa para diagnóstico
+            const envIdx = uploadPageHtml.indexOf('enviarRemessa');
+            if (envIdx >= 0) {
+                console.log(`[CRA21 Portal] HTML[enviarRemessa-600..+100]: ${uploadPageHtml.slice(Math.max(0, envIdx-600), envIdx+100)}`);
+            }
+        }
+
+        // Busca CraVisaoAcessoLogin.js para detectar campo "code" injetado por JS
+        try {
+            const loginJsSrc = allScriptSrcList.find(s => /AcessoLogin/i.test(s));
+            if (loginJsSrc) {
+                let loginJsUrl = loginJsSrc.startsWith('http') ? loginJsSrc
+                    : loginJsSrc.startsWith('/') ? `https://cra${uf}.crabr.com.br${loginJsSrc}`
+                    : `https://cra${uf}.crabr.com.br/${loginJsSrc.replace(/^(\.\.\/)+/, '')}`;
+                const loginJsR = await axios.get(loginJsUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 12000
+                });
+                const loginJsContent = String(loginJsR.data);
+                // Loga trechos relevantes: campos adicionados ao formulário, code, NTISPOSTBACK
+                const loginJsRelevant = loginJsContent.match(/(?:\.val\(|\.append\(|\.prepend\(|code|NTIS|\.submit|enviar|upload|remessa)[^;]{0,200}/gi) || [];
+                console.log(`[CRA21 Portal] CraVisaoAcessoLogin.js size=${loginJsContent.length} | trechos relevantes: ${JSON.stringify(loginJsRelevant.slice(0, 10))}`);
+                // Verifica se o JS injeta um campo 'code'
+                if (/['"]\s*code\s*['"]|name\s*=\s*['"]code['"]/i.test(loginJsContent)) {
+                    console.log(`[CRA21 Portal] ⚠ CraVisaoAcessoLogin.js MENCIONA campo "code" — pode ser necessário`);
+                }
+            }
+        } catch (eLogin) {
+            console.log(`[CRA21 Portal] Erro ao buscar CraVisaoAcessoLogin.js: ${eLogin.message}`);
+        }
+
+        console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}" | formPostUrl: ${formPostUrl.slice(-80)}`);
 
         // Monta multipart/form-data manualmente
         const fileBuffer = Buffer.from(arquivoBase64, 'base64');
@@ -1508,8 +1578,8 @@ app.post('/cra21/upload-portal', async (req, res) => {
         // IMPORTANTE: browser NÃO envia X-Requested-With (é form submit normal, não AJAX)
         // ═══════════════════════════════════════════════════════════════
 
-        // NTSUPERIORREF: URL da página de origem (no browser era a lista de confirmações).
-        // Usamos a URL de upload como self-reference — o Sis21 aceita qualquer URL válida do portal.
+        // NTSUPERIORREF: URL da página de origem.
+        // Usamos o uploadUrl (página de display) como origem — é de lá que o usuário submete o form.
         const ntsuperiorref = creds.ntsuperiorref || uploadUrl;
 
         const bndMain = `----WebKitFormBoundary${Date.now()}`;
@@ -1526,14 +1596,14 @@ app.post('/cra21/upload-portal', async (req, res) => {
         //   - Body: NTISPOSTBACK=1, NTSUPERIORREF, enviarRemessa=<arquivo>, enviar=""
         // ═══════════════════════════════════════════════════════════════
         const mobileUA = 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36';
-        console.log(`[CRA21 Portal] POST upload (form submit) | NTSUPERIORREF: ${ntsuperiorref.slice(0,80)}...`);
-        let uploadR = await axios.post(uploadUrl, bodyMain, {
+        console.log(`[CRA21 Portal] POST upload (form submit) → ${formPostUrl.slice(-100)} | NTSUPERIORREF: ${ntsuperiorref.slice(0,80)}...`);
+        let uploadR = await axios.post(formPostUrl, bodyMain, {
             headers: {
                 'Content-Type': `multipart/form-data; boundary=${bndMain}`,
                 'Content-Length': bodyMain.length,
                 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
                 'User-Agent': mobileUA,
-                'Referer': uploadUrl,
+                'Referer': uploadUrl,   // a página de onde o form é submetido
                 'Origin': `https://cra${uf}.crabr.com.br`,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
