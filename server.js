@@ -968,46 +968,94 @@ app.post('/cra21/cancelar', async (req, res) => {
 // ROTA 17 — Upload de remessa direto ao portal web CRA21
 // ============================================================
 
+// Helper: extrai PHPSESSID dos headers set-cookie
+function extractPhpsessid(headers) {
+    for (const c of (headers['set-cookie'] || [])) {
+        const m = c.match(/PHPSESSID=([^;]+)/i);
+        if (m) return m[1];
+    }
+    return '';
+}
+
+// Helper: extrai acao da URL ou HTML
+function extractAcao(urlOrHtml) {
+    // Da URL: ?acao=XXX ou &acao=XXX
+    const mUrl = urlOrHtml.match(/[?&]acao=([A-Za-z0-9+/%=]+)/);
+    if (mUrl) return decodeURIComponent(mUrl[1]);
+    // Do HTML: action="...?acao=XXX"
+    const mAct = urlOrHtml.match(/action="[^"]*[?&]acao=([A-Za-z0-9+/=]+)/i);
+    if (mAct) return mAct[1];
+    // Do HTML: input name="acao" value="XXX"
+    const mInp = urlOrHtml.match(/<input[^>]*name="acao"[^>]*value="([A-Za-z0-9+/=]+)"/i)
+              || urlOrHtml.match(/<input[^>]*value="([A-Za-z0-9+/=]+)"[^>]*name="acao"/i);
+    if (mInp) return mInp[1];
+    return '';
+}
+
 // Helper: login automático no portal CRA21 e retorna PHPSESSID
 async function cra21PortalLogin(usuario, senha, estado) {
     const uf = (estado || 'AM').toLowerCase();
     const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
     const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-    // Passo 1: GET página de login para obter PHPSESSID inicial e acao do formulário
-    const pageR = await axios.get(`${portalBase}/`, {
+    // Passo 1: GET raiz SEM seguir redirect — precisamos da URL do redirect que tem o acao de login
+    const rootR = await axios.get(`${portalBase}/`, {
         headers: { 'User-Agent': userAgent, 'Cookie': 'aceito-cookie=yes' },
-        validateStatus: () => true, maxRedirects: 5
+        validateStatus: () => true,
+        maxRedirects: 0   // NÃO segue redirect — precisamos do Location header
     });
 
-    let phpsessid = '';
-    for (const c of (pageR.headers['set-cookie'] || [])) {
-        const m = c.match(/PHPSESSID=([^;]+)/i);
-        if (m) { phpsessid = m[1]; break; }
+    let phpsessid = extractPhpsessid(rootR.headers) || '';
+
+    // O portal redireciona para admin.php?acao=<login_acao>
+    let loginAcao = '';
+    const location = rootR.headers['location'] || rootR.headers['Location'] || '';
+    console.log(`[CRA21 Portal] root status=${rootR.status} location=${location.slice(0,120)}`);
+
+    if (location) {
+        // Extrai acao da URL de redirect
+        loginAcao = extractAcao(location);
     }
-
-    const html = String(pageR.data);
-
-    // Extrai acao do formulário de login (no atributo action ou em input hidden)
-    const m1 = html.match(/action="[^"]*[?&]acao=([A-Za-z0-9+/=]+)/i);
-    const m2 = html.match(/<input[^>]*name="acao"[^>]*value="([A-Za-z0-9+/=]+)"/i)
-            || html.match(/<input[^>]*value="([A-Za-z0-9+/=]+)"[^>]*name="acao"/i);
-    const loginAcao = (m1 || m2)?.[1] || '';
 
     if (!loginAcao) {
-        // Verifica se já está autenticado
-        if (html.includes('menuApresentante') || html.includes('Upload remessa') || html.includes('CraMenu')) {
-            console.log('[CRA21 Portal] Já autenticado');
-            return { phpsessid, portalBase };
+        // Fallback: segue redirect manualmente e lê o HTML
+        const pageR = await axios.get(location || `${portalBase}/admin.php`, {
+            headers: { 'User-Agent': userAgent, 'Cookie': `aceito-cookie=yes${phpsessid?'; PHPSESSID='+phpsessid:''}` },
+            validateStatus: () => true, maxRedirects: 5
+        });
+        const newSess = extractPhpsessid(pageR.headers);
+        if (newSess) phpsessid = newSess;
+        const html = String(pageR.data);
+        console.log(`[CRA21 Portal] fallback html[0..300]: ${html.slice(0,300)}`);
+        loginAcao = extractAcao(html);
+
+        if (!loginAcao) {
+            // Já logado?
+            if (html.includes('menuApresentante') || html.includes('Upload remessa') || html.includes('CraMenu')) {
+                console.log('[CRA21 Portal] Já autenticado (sem login)');
+                return { phpsessid, portalBase };
+            }
+            throw new Error(`Portal CRA21: não encontrei formulário de login. HTML[0..200]: ${html.slice(0,200)}`);
         }
-        throw new Error('Não encontrei o formulário de login do portal CRA21. Verifique as credenciais.');
     }
 
-    // Detecta nomes dos campos usuário/senha no formulário
-    const userField = (html.match(/<input[^>]*type="text"[^>]*name="([^"]+)"/i) || [])[1] || 'usuario';
-    const passField = (html.match(/<input[^>]*type="password"[^>]*name="([^"]+)"/i) || [])[1] || 'senha';
+    console.log(`[CRA21 Portal] Login acao: ${loginAcao.slice(0,30)}... | PHPSESSID: ${phpsessid.slice(0,8)}...`);
 
-    // Passo 2: POST com credenciais
+    // Passo 2: GET da página de login para obter PHPSESSID atualizado + nomes dos campos
+    const loginPageR = await axios.get(`${portalBase}/admin.php?acao=${loginAcao}`, {
+        headers: { 'User-Agent': userAgent, 'Cookie': `aceito-cookie=yes${phpsessid?'; PHPSESSID='+phpsessid:''}` },
+        validateStatus: () => true, maxRedirects: 3
+    });
+    const newSess2 = extractPhpsessid(loginPageR.headers);
+    if (newSess2) phpsessid = newSess2;
+    const loginPageHtml = String(loginPageR.data);
+
+    // Detecta nomes dos campos usuário/senha
+    const userField = (loginPageHtml.match(/<input[^>]*type="text"[^>]*name="([^"]+)"/i) || [])[1] || 'usuario';
+    const passField = (loginPageHtml.match(/<input[^>]*type="password"[^>]*name="([^"]+)"/i) || [])[1] || 'senha';
+    console.log(`[CRA21 Portal] campos: user="${userField}" pass="${passField}"`);
+
+    // Passo 3: POST com credenciais
     const form = new URLSearchParams();
     form.append('NTISPOSTBACK', '1');
     form.append('NTSUPERIORREF', `${portalBase}/`);
@@ -1022,23 +1070,21 @@ async function cra21PortalLogin(usuario, senha, estado) {
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
                 'User-Agent': userAgent,
-                'Referer': `${portalBase}/`
+                'Referer': `${portalBase}/admin.php?acao=${loginAcao}`
             },
             validateStatus: () => true, maxRedirects: 5
         }
     );
 
-    for (const c of (loginR.headers['set-cookie'] || [])) {
-        const m = c.match(/PHPSESSID=([^;]+)/i);
-        if (m) { phpsessid = m[1]; break; }
-    }
+    const newSess3 = extractPhpsessid(loginR.headers);
+    if (newSess3) phpsessid = newSess3;
 
     const loginHtml = String(loginR.data);
     if (loginHtml.toLowerCase().includes('type="password"') && !loginHtml.includes('menuApresentante')) {
         throw new Error('Usuário ou senha incorretos no portal CRA21.');
     }
 
-    console.log(`[CRA21 Portal] Login OK | sessão: ${phpsessid.slice(0,8)}...`);
+    console.log(`[CRA21 Portal] Login OK | PHPSESSID: ${phpsessid.slice(0,8)}...`);
     return { phpsessid, portalBase };
 }
 
