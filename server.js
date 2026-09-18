@@ -1133,38 +1133,89 @@ app.get('/cra21/debug-js', async (req, res) => {
             phpsessid = r.phpsessid;
         }
 
-        const jsUrls = [
-            `${baseUrl}/cra/site/js/common/cra.js?v=12.1.7`,
-            `${baseUrl}/cra/site/js/CraVisaoPaginaAdm.js?v=12.1.7`,
-            `${baseUrl}/cra/site/js/scripts.js?v=12.1.7`,
-        ];
-
-        const results = {};
-        for (const url of jsUrls) {
-            const r = await axios.get(url, {
-                headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
-                validateStatus: () => true, timeout: 15000
-            });
-            results[url.split('/').pop().split('?')[0]] = {
-                status: r.status,
-                size: String(r.data).length,
-                content: String(r.data)
-            };
-        }
-
-        // Também loga a página de upload completa para ver o HTML oculto
-        const UPLOAD_ACAO_DISPLAY = creds.uploadAcao ||
-            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9By2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
-        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_DISPLAY}`;
-        const pageR = await axios.get(uploadUrl, {
+        // ── Busca a página de upload primeiro (para extrair script tags reais) ──
+        const UPLOAD_ACAO_DISPLAY_DBG = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        const uploadUrlDbg = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_DISPLAY_DBG}`;
+        const pageR = await axios.get(uploadUrlDbg, {
             headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
             validateStatus: () => true, maxRedirects: 3
         });
+        const pageHtml = String(pageR.data);
+
+        const results = {};
         results['_uploadPageHtml'] = {
             status: pageR.status,
-            size: String(pageR.data).length,
-            content: String(pageR.data)
+            size: pageHtml.length,
+            content: pageHtml   // retorna HTML COMPLETO para análise
         };
+
+        // ── Extrai TODOS os <script src="..."> da página de upload ──
+        const allSrcs = [];
+        const srcRe = /src=["']([^"']+\.js[^"']*)["']/gi;
+        let sm9;
+        while ((sm9 = srcRe.exec(pageHtml)) !== null) allSrcs.push(sm9[1]);
+        results['_scriptTags'] = allSrcs;
+
+        // ── Filtra JS de interesse (não libs genéricas) ──
+        const interestingSrcs = allSrcs.filter(src =>
+            /cra\.js|CraVisao|CraApresentante|scripts\.js/i.test(src) &&
+            !/sislib21|Lib21|jquery|maskedinput|ie-fix|Assinatura|Relogio|Relatorio|RestPki|GoogleAnalytics|Remarketing|quick-sidebar|Md5|AcessoLogin/i.test(src)
+        );
+        // Fallback: se não encontrou nada específico, pega os 5 primeiros não-lib
+        const jsSrcs = interestingSrcs.length > 0 ? interestingSrcs
+            : allSrcs.filter(s => !/sislib21|jquery|GoogleAnalytics|Remarketing|Md5/i.test(s)).slice(0, 5);
+        results['_jsAlvo'] = jsSrcs;
+
+        // ── Busca conteúdo de cada JS alvo ──
+        // path correto: /{uf}/site/js/... (não /cra/site/js/)
+        for (const relSrc of jsSrcs.slice(0, 8)) {
+            try {
+                // Resolve URL completa: absoluta, relativa ao domínio, ou relativa ao path
+                let fullUrl;
+                if (relSrc.startsWith('http')) {
+                    fullUrl = relSrc;
+                } else if (relSrc.startsWith('/')) {
+                    fullUrl = `${baseUrl}${relSrc}`;
+                } else {
+                    // relativo ao portalBase (/craam/site/)
+                    fullUrl = `${portalBase}/${relSrc.replace(/^\.\.\//, '').replace(/^\//, '')}`;
+                }
+                const jsR = await axios.get(fullUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 20000
+                });
+                const jsC = String(jsR.data);
+                results[relSrc.split('/').pop().split('?')[0]] = {
+                    status: jsR.status,
+                    size: jsC.length,
+                    url: fullUrl,
+                    content: jsC   // conteúdo COMPLETO — sem truncamento
+                };
+            } catch (e2) {
+                results[relSrc.split('/').pop().split('?')[0]] = { error: e2.message };
+            }
+        }
+
+        // ── Sempre busca cra.js e CraVisaoPaginaAdm.js com path correto ──
+        const fixedJs = [
+            `${baseUrl}/cra${uf}/site/js/common/cra.js`,
+            `${baseUrl}/cra${uf}/site/js/CraVisaoPaginaAdm.js`,
+            `${baseUrl}/cra${uf}/site/js/scripts.js`,
+        ];
+        for (const url of fixedJs) {
+            const key = url.split('/').pop().split('?')[0];
+            if (results[key]) continue;   // já foi buscado acima
+            try {
+                const r = await axios.get(url, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 20000
+                });
+                results[key] = { status: r.status, size: String(r.data).length, url, content: String(r.data) };
+            } catch (e3) {
+                results[key] = { error: e3.message };
+            }
+        }
 
         return res.json({ ok: true, phpsessid: phpsessid.slice(0,8)+'...', results });
     } catch (e) {
@@ -1288,89 +1339,113 @@ app.post('/cra21/upload-portal', async (req, res) => {
 
         console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
 
-        // ── Busca SOMENTE os JS que podem ter a config do upload ──
-        // Ignoramos sislib21/* (CPF/CNPJ/AJAX helpers — confirmado sem upload).
-        // Focamos em: scripts.js, cra.js, CraVisaoPaginaAdm.js, CraApresentante*.js
-        try {
-            const baseUrl = `https://craam.crabr.com.br`;
-            const uploadKwStrict = ['fileupload', 'enviarRemessa', 'fileUpload', 'FormData', 'tipoFuncao'];
-
-            // Pega todos os src de scripts da página
-            const allScriptSrcs3 = [];
-            const scriptRe3 = /src=["']([^"']+\.js[^"']*)["']/gi;
-            let sm4;
-            while ((sm4 = scriptRe3.exec(uploadPageHtml)) !== null) allScriptSrcs3.push(sm4[1]);
-
-            // Filtra SOMENTE os arquivos de interesse (não sislib21, não libs genéricas)
-            const targetFiles = allScriptSrcs3.filter(src =>
-                /scripts\.js|cra\.js|CraVisaoPaginaAdm|CraApresentante/i.test(src) &&
-                !/sislib21|Lib21|jquery|maskedinput|ie-fix|Assinatura|Relogio|Relatorio|RestPki|GoogleAnalytics|Remarketing|quick-sidebar|Md5|AcessoLogin/i.test(src)
-            );
-            console.log(`[CRA21-JS] Arquivos alvo: ${JSON.stringify(targetFiles)}`);
-
-            for (const relSrc of targetFiles.slice(0, 6)) {
-                try {
-                    const cleanPath = relSrc.replace(/^\.\.\/\.\.\//, '/');
-                    const tryUrl = `${baseUrl}${cleanPath}`;
-                    console.log(`[CRA21-JS] Buscando: ${tryUrl}`);
-                    const jsR = await axios.get(tryUrl, {
-                        headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
-                        validateStatus: () => true, maxRedirects: 2, timeout: 15000
-                    });
-                    const jsC = String(jsR.data);
-                    const hits = uploadKwStrict.filter(kw => jsC.includes(kw));
-                    console.log(`[CRA21-JS] ${relSrc.split('/').pop().split('?')[0]} status=${jsR.status} size=${jsC.length} hits=[${hits.join(',')}]`);
-                    // Sempre loga o conteúdo para scripts de interesse, em fatias de 3000
-                    for (let off = 0; off < Math.min(jsC.length, 15000); off += 3000) {
-                        console.log(`[CRA21-JS] CONTENT[${off}..${off+3000}]: ${jsC.slice(off, off+3000)}`);
-                    }
-                } catch (e2) {
-                    console.log(`[CRA21-JS] ERRO ao buscar ${relSrc}: ${e2.message}`);
-                }
-            }
-        } catch (jsErr) {
-            console.log(`[CRA21-JS] Erro geral: ${jsErr.message}`);
-        }
-
-        // Monta multipart/form-data manualmente (sem dependência extra de npm)
+        // Monta multipart/form-data manualmente
         const fileBuffer = Buffer.from(arquivoBase64, 'base64');
         const nome = nomeArquivo || 'remessa.xlsx';
-        const boundary = `----CraBoundary${Date.now()}`;
 
-        const mkField = (name, value) => Buffer.from(
-            `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
+        // Extrai valor do campo tipoRemessa/tipo da página (select ou hidden na HTML)
+        // A página retorna login widget em HTML cru, mas pode ter hidden fields ou inline JS
+        let tipoRemessaVal = '1';  // default: tipo 1 (remessa padrão apresentante)
+        const tipoRemOpts = uploadPageHtml.match(/name="(?:tipoRemessa|tipo_remessa|tipoEnvio)[^"]*"[^>]*value="([^"]*)"/i);
+        if (tipoRemOpts) tipoRemessaVal = tipoRemOpts[1];
+        // Tenta encontrar no inline JS (ex: tipoRemessa: "01" ou value: '01')
+        const tipoRemJs = uploadPageHtml.match(/tipoRemessa['":\s]+['"](\w+)['"]/i);
+        if (tipoRemJs) tipoRemessaVal = tipoRemJs[1];
 
-        // ── POST estilo jQuery File Upload (AJAX para tipoFuncao=2) ──
-        // O Sis21 usa tipoFuncao=2 tanto para GET (display) quanto para POST AJAX (upload).
-        // O PHP diferencia pelo header X-Requested-With: XMLHttpRequest.
-        // tipoFuncao=1 retorna 500 (o handler de ação não suporta multipart).
-        // Enviamos APENAS o arquivo — sem login/senha/NTISPOSTBACK.
-        const parts = [];
-        // Arquivo
-        parts.push(Buffer.from(
-            `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${nome}"\r\n` +
-            `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'));
-        parts.push(fileBuffer);
-        parts.push(Buffer.from('\r\n', 'utf-8'));
-        parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
+        console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | tipoRemessa="${tipoRemessaVal}" | PHPSESSID: ${phpsessid.slice(0,8)}...`);
 
-        const body = Buffer.concat(parts);
+        // Função auxiliar para montar multipart
+        const buildMultipart = (bnd, fields, fileFld, fileName, fileBuf) => {
+            const mk = (name, val) => Buffer.from(
+                `--${bnd}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${val}\r\n`, 'utf-8');
+            const parts = fields.map(([n, v]) => mk(n, v));
+            parts.push(Buffer.from(
+                `--${bnd}\r\nContent-Disposition: form-data; name="${fileFld}"; filename="${fileName}"\r\n` +
+                `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'));
+            parts.push(fileBuf);
+            parts.push(Buffer.from(`\r\n--${bnd}--\r\n`, 'utf-8'));
+            return Buffer.concat(parts);
+        };
 
-        console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | PHPSESSID: ${phpsessid.slice(0,8)}...`);
-        console.log(`[CRA21 Portal] POST URL (tipoFuncao=2/display+AJAX): ${uploadUrl}`);
-        const uploadR = await axios.post(uploadUrl, body, {
+        // ═══════════════════════════════════════════════════════════════
+        // ESTRATÉGIA 1: tipoFuncao=1 (action) + NTISPOSTBACK=1 + tipoRemessa
+        // ─ Nunca tentado antes com NTISPOSTBACK=1. O PHP action handler
+        //   processa o upload sem tocar no widget de login.
+        // ═══════════════════════════════════════════════════════════════
+        const bnd1 = `----CraBoundary${Date.now()}A`;
+        const extraFields1 = [
+            ['NTISPOSTBACK', '1'],
+            ['tipoRemessa', tipoRemessaVal],
+        ];
+        // Adiciona campos hidden extraídos da página (exceto login/senha)
+        for (const { n, v } of hiddenFields) extraFields1.push([n, v]);
+        const body1 = buildMultipart(bnd1, extraFields1, fileField, nome, fileBuffer);
+
+        console.log(`[CRA21 Portal] Tentativa 1: POST tipoFuncao=1 (action) + NTISPOSTBACK=1 | URL: ${uploadPostUrl}`);
+        const uploadR1 = await axios.post(uploadPostUrl, body1, {
             headers: {
-                'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                'Content-Length': body.length,
+                'Content-Type': `multipart/form-data; boundary=${bnd1}`,
+                'Content-Length': body1.length,
                 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
                 'User-Agent': userAgent,
                 'Referer': uploadUrl,
-                // X-Requested-With faz o PHP entrar no handler AJAX (não valida form de login)
-                'X-Requested-With': 'XMLHttpRequest'
+                'X-Requested-With': 'XMLHttpRequest',
             },
             validateStatus: () => true,
             maxRedirects: 5
         });
+
+        const resp1Html = String(uploadR1.data);
+        const ct1 = (uploadR1.headers['content-type'] || '').toLowerCase();
+        console.log(`[CRA21 Portal] Tentativa 1 status=${uploadR1.status} ct=${ct1} size=${resp1Html.length}`);
+        console.log(`[CRA21 Portal] Tentativa 1 body[0..1000]: ${resp1Html.slice(0, 1000)}`);
+
+        // Detecta sucesso na tentativa 1
+        const isValidationErr1 = /informar os campos|campos marcados/i.test(resp1Html);
+        const isSuccess1 = (uploadR1.status >= 200 && uploadR1.status < 300 && !isValidationErr1 && uploadR1.status !== 500)
+            && (
+                ct1.includes('json')
+                || resp1Html.trimStart().startsWith('{')
+                || resp1Html.trimStart().startsWith('[')
+                || resp1Html.includes('sucesso')
+                || resp1Html.includes('enviado')
+                || resp1Html.includes('CraHome')
+            );
+
+        if (isSuccess1) {
+            console.log(`[CRA21 Portal] Tentativa 1 SUCESSO!`);
+        } else {
+            console.log(`[CRA21 Portal] Tentativa 1 falhou (validationErr=${isValidationErr1} status=${uploadR1.status}) — tentando Estratégia 2`);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ESTRATÉGIA 2: tipoFuncao=2 (display) + X-Requested-With AJAX
+        //   (abordagem atual que retorna "Informar os campos")
+        // ═══════════════════════════════════════════════════════════════
+        let uploadR = uploadR1;
+        if (!isSuccess1) {
+            const bnd2 = `----CraBoundary${Date.now()}B`;
+            // Só o arquivo — sem NTISPOSTBACK, sem login, sem tipoRemessa (jQuery FU puro)
+            const body2 = buildMultipart(bnd2, [], fileField, nome, fileBuffer);
+
+            console.log(`[CRA21 Portal] Tentativa 2: POST tipoFuncao=2 + X-Requested-With (AJAX) | URL: ${uploadUrl}`);
+            uploadR = await axios.post(uploadUrl, body2, {
+                headers: {
+                    'Content-Type': `multipart/form-data; boundary=${bnd2}`,
+                    'Content-Length': body2.length,
+                    'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                    'User-Agent': userAgent,
+                    'Referer': uploadUrl,
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                validateStatus: () => true,
+                maxRedirects: 5
+            });
+            const resp2Html = String(uploadR.data);
+            const ct2 = (uploadR.headers['content-type'] || '').toLowerCase();
+            console.log(`[CRA21 Portal] Tentativa 2 status=${uploadR.status} ct=${ct2} size=${resp2Html.length}`);
+            console.log(`[CRA21 Portal] Tentativa 2 body[0..1000]: ${resp2Html.slice(0, 1000)}`);
+        }
 
         const uploadRespRaw = uploadR.data;
         const uploadRespHtml = String(uploadRespRaw);
