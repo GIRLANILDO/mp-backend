@@ -1524,7 +1524,7 @@ app.post('/cra21/upload-portal', async (req, res) => {
         // O <form action="..."> pode conter tipoFuncao=1 para processar.
         // Usar a URL errada faz Sis21 chamar apresentar() em vez de processar().
         // ═══════════════════════════════════════════════════════════
-        let formPostUrl = uploadPostUrl;  // usa tipoFuncao=1 (action/process) como default
+        let formPostUrl = uploadUrl;  // tipoFuncao=2 — o portal Sis21 aceita POST de upload neste acao (não no tipoFuncao=1 que retorna 500)
 
         // Tenta encontrar o <form> que contém o campo enviarRemessa e pegar seu action
         const formHtmlM = uploadPageHtml.match(/<form(?:[^>]*)>([\s\S]{0,6000}?)<\/form>/gi) || [];
@@ -1556,7 +1556,7 @@ app.post('/cra21/upload-portal', async (req, res) => {
             }
             console.log(`[CRA21 Portal] ✓ Form action extraído: ${formPostUrl.slice(0, 150)}`);
         } else {
-            console.log(`[CRA21 Portal] ⚠ Form action NÃO encontrado — usando uploadUrl como fallback`);
+            console.log(`[CRA21 Portal] ✓ Form action NÃO encontrado no HTML estático (form dinâmico) — usando uploadUrl (tipoFuncao=2) para upload`);
             // Loga o HTML em volta de enviarRemessa para diagnóstico
             const envIdx = uploadPageHtml.indexOf('enviarRemessa');
             if (envIdx >= 0) {
