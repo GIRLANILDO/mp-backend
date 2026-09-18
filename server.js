@@ -1592,7 +1592,23 @@ app.post('/cra21/upload-portal', async (req, res) => {
 
         // Monta multipart/form-data manualmente
         const fileBuffer = Buffer.from(arquivoBase64, 'base64');
-        const nome = nomeArquivo || 'remessa.xlsx';
+
+        // ── Nome do arquivo no Padrão Febraban: X{CNPJ_14_dígitos}.xlsx ──
+        // Tenta: 1) creds.cnpj, 2) creds.codApres (se for CNPJ de 14 dígitos)
+        const cnpjClean = (creds.cnpj || creds.codApres || '').replace(/\D/g, '');
+        let nome;
+        if (cnpjClean.length === 14) {
+            nome = `X${cnpjClean}.xlsx`;
+            console.log(`[CRA21 Portal] Nome Febraban gerado: ${nome}`);
+        } else if (cnpjClean.length > 0) {
+            // Tem algo mas não são 14 dígitos — usa mesmo assim com aviso
+            nome = `X${cnpjClean}.xlsx`;
+            console.log(`[CRA21 Portal] ⚠ CNPJ/codApres com ${cnpjClean.length} dígitos (esperado 14): ${nome}`);
+        } else {
+            // Sem CNPJ configurado — usa o que o frontend enviou como fallback
+            nome = nomeArquivo || 'remessa.xlsx';
+            console.log(`[CRA21 Portal] ⚠ CNPJ não configurado em creds — configure 'cnpj' nas credenciais CRA21. Usando: ${nome}`);
+        }
 
         // Extrai valor do campo tipoRemessa/tipo da página (select ou hidden na HTML)
         // A página retorna login widget em HTML cru, mas pode ter hidden fields ou inline JS
