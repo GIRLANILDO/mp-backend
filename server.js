@@ -1332,6 +1332,20 @@ app.post('/cra21/upload-portal', async (req, res) => {
         });
         const uploadPageHtml = String(uploadPageR.data);
 
+        // ── Log do corpo da página para encontrar onde fileupload é configurado ──
+        const fuInPageIdx = uploadPageHtml.toLowerCase().indexOf('fileupload');
+        if (fuInPageIdx >= 0) {
+            console.log(`[CRA21 Portal] uploadPage HTML[fileupload@${fuInPageIdx}]: ${uploadPageHtml.slice(Math.max(0,fuInPageIdx-200), fuInPageIdx+800)}`);
+        } else {
+            console.log(`[CRA21 Portal] "fileupload" NÃO encontrado no HTML da página`);
+            // Log das seções do body para análise
+            console.log(`[CRA21 Portal] uploadPage HTML[3000..6000]: ${uploadPageHtml.slice(3000, 6000)}`);
+            console.log(`[CRA21 Portal] uploadPage HTML[6000..10000]: ${uploadPageHtml.slice(6000, 10000)}`);
+        }
+        // Confirma se enviarRemessa está no HTML estático
+        const envInPage = uploadPageHtml.indexOf('enviarRemessa');
+        console.log(`[CRA21 Portal] "enviarRemessa" no HTML estático: ${envInPage >= 0 ? `sim @${envInPage} => ${uploadPageHtml.slice(Math.max(0,envInPage-300), envInPage+300)}` : 'NÃO — form é dinâmico'}`);
+
         // ── Extrai e loga script src's (compacto, não trunca nos logs do Railway) ──
         const allScriptSrcList = [];
         { const re = /src=["']([^"']+\.js[^"']*)["']/gi; let m2;
