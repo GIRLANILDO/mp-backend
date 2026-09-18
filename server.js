@@ -1154,43 +1154,85 @@ app.post('/cra21/upload-portal', async (req, res) => {
             await db.collection('settings').doc(ownerId).update({ 'cra21.phpsessid': phpsessid });
         }
 
+        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`;
+
+        // GET da página de upload para capturar campos hidden e valor do botão submit
+        const uploadPageR = await axios.get(uploadUrl, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 3
+        });
+        const uploadPageHtml = String(uploadPageR.data);
+        console.log(`[CRA21 Portal] Upload page html[0..600]: ${uploadPageHtml.slice(0,600)}`);
+
+        // Extrai campos hidden da página (exceto acao e PHPSESSID)
+        const hiddenFields = [];
+        const hiddenRe = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
+        let hm;
+        while ((hm = hiddenRe.exec(uploadPageHtml)) !== null) {
+            const n = hm[1], v = hm[2];
+            if (n !== 'acao' && n !== 'PHPSESSID') hiddenFields.push({ n, v });
+        }
+        // Também tenta name antes de value
+        const hiddenRe2 = /<input[^>]*type="hidden"[^>]*value="([^"]*)"[^>]*name="([^"]+)"[^>]*>/gi;
+        const found = new Set(hiddenFields.map(h => h.n));
+        while ((hm = hiddenRe2.exec(uploadPageHtml)) !== null) {
+            const n = hm[2], v = hm[1];
+            if (n !== 'acao' && n !== 'PHPSESSID' && !found.has(n)) hiddenFields.push({ n, v });
+        }
+
+        // Nome do campo file e valor do botão submit
+        const fileFieldM = uploadPageHtml.match(/<input[^>]*type="file"[^>]*name="([^"]+)"/i)
+                        || uploadPageHtml.match(/<input[^>]*name="([^"]+)"[^>]*type="file"/i);
+        const fileField = fileFieldM ? fileFieldM[1] : 'enviarRemessa';
+
+        const submitM = uploadPageHtml.match(/<input[^>]*type="submit"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/i)
+                     || uploadPageHtml.match(/<button[^>]*type="submit"[^>]*name="([^"]+)"[^>]*>([^<]+)<\/button>/i);
+        const submitName  = submitM ? submitM[1] : 'enviar';
+        const submitValue = submitM ? submitM[2].trim() : 'Enviar';
+
+        console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
+
         // Monta multipart/form-data manualmente (sem dependência extra de npm)
         const fileBuffer = Buffer.from(arquivoBase64, 'base64');
         const nome = nomeArquivo || 'remessa.xlsx';
         const boundary = `----CraBoundary${Date.now()}`;
 
-        const field = (name, value) => Buffer.from(
+        const mkField = (name, value) => Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
 
-        const body = Buffer.concat([
-            field('NTISPOSTBACK', '1'),
-            field('NTSUPERIORREF', `${portalBase}/admin.php?`),
-            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="enviarRemessa"; filename="${nome}"\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'),
-            fileBuffer,
-            Buffer.from('\r\n', 'utf-8'),
-            field('enviar', ''),
-            Buffer.from(`--${boundary}--\r\n`, 'utf-8')
-        ]);
+        const parts = [
+            mkField('NTISPOSTBACK', '1'),
+            mkField('NTSUPERIORREF', uploadUrl),
+        ];
+        // Campos hidden da página
+        for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
+        // Arquivo
+        parts.push(Buffer.from(
+            `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${nome}"\r\n` +
+            `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'));
+        parts.push(fileBuffer);
+        parts.push(Buffer.from('\r\n', 'utf-8'));
+        // Botão submit com valor real
+        parts.push(mkField(submitName, submitValue));
+        parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
+
+        const body = Buffer.concat(parts);
 
         console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | PHPSESSID: ${phpsessid.slice(0,8)}...`);
 
-        const uploadR = await axios.post(
-            `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`,
-            body,
-            {
-                headers: {
-                    'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                    'Content-Length': body.length,
-                    'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
-                    'User-Agent': userAgent,
-                    'Referer': `${portalBase}/admin.php?`
-                },
-                validateStatus: () => true,
-                maxRedirects: 5
-            }
-        );
+        const uploadR = await axios.post(uploadUrl, body, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                'Content-Length': body.length,
+                'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                'User-Agent': userAgent,
+                'Referer': uploadUrl
+            },
+            validateStatus: () => true,
+            maxRedirects: 5
+        });
 
-        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | resp: ${String(uploadR.data).slice(0,400)}`);
+        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | resp: ${String(uploadR.data).slice(0,600)}`);
 
         const htmlR = String(uploadR.data);
 
@@ -1202,16 +1244,37 @@ app.post('/cra21/upload-portal', async (req, res) => {
             return res.json({ ok: false, erro: `Portal CRA21 retornou status ${uploadR.status}` });
         }
 
-        // Detecta mensagem de sucesso/erro no HTML retornado
-        const erroM = htmlR.match(/class="[^"]*(?:alert-danger|bg-danger|text-danger)[^"]*"[^>]*>([\s\S]{1,300}?)<\/(?:div|p|span)>/i);
-        const succM = htmlR.match(/class="[^"]*(?:alert-success|bg-success|text-success)[^"]*"[^>]*>([\s\S]{1,300}?)<\/(?:div|p|span)>/i);
+        // Detecta mensagens de erro/sucesso no HTML retornado (múltiplos padrões do Sis21)
+        const strip = s => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        if (erroM) {
-            const msg = erroM[1].replace(/<[^>]+>/g, '').trim();
-            return res.json({ ok: false, erro: msg || 'Erro no portal CRA21.' });
+        // Padrões de ERRO
+        const erroPatterns = [
+            /class="[^"]*(?:alert-danger|bg-danger|text-danger|mensagem-erro|msg-erro|erro)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
+            /<(?:div|p|span)[^>]*id="[^"]*(?:erro|error|msg)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span)>/i,
+            /Informar os campos[^<]{0,200}/i,
+            /Erro[^<]{0,200}/i,
+        ];
+        // Padrões de SUCESSO
+        const succPatterns = [
+            /class="[^"]*(?:alert-success|bg-success|text-success|mensagem-sucesso|msg-sucesso|sucesso)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
+            /(?:Remessa|arquivo|upload)[^<]{0,200}(?:sucesso|processad|enviad|import)/i,
+        ];
+
+        let erroMsg = '', succMsg = '';
+        for (const p of erroPatterns) {
+            const m = htmlR.match(p);
+            if (m) { erroMsg = strip(m[1] || m[0]); break; }
+        }
+        for (const p of succPatterns) {
+            const m = htmlR.match(p);
+            if (m) { succMsg = strip(m[1] || m[0]); break; }
         }
 
-        const msg = succM ? succM[1].replace(/<[^>]+>/g, '').trim() : 'Remessa enviada ao portal CRA21 com sucesso.';
+        if (erroMsg && !succMsg) {
+            return res.json({ ok: false, erro: erroMsg });
+        }
+
+        const msg = succMsg || (erroMsg ? '' : 'Remessa enviada ao portal CRA21 com sucesso.');
         return res.json({ ok: true, mensagem: msg });
 
     } catch (e) {
