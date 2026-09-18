@@ -900,29 +900,40 @@ app.post('/cra21/enviar-remessa', async (req, res) => {
         return res.json({ ok: false, erro: 'ownerId e titulos[] obrigatórios' });
     try {
         const creds = await getCra21Creds(ownerId);
+        const codApres   = creds.codApres   || '';
+        const idCartorio = creds.idCartorio || '';
+        const params = new URLSearchParams();
+        if (idCartorio) params.set('idCartorio', idCartorio);
+        if (codApres)   params.set('idApresentante', codApres);
+        const qs = params.toString();
         const payload = titulos.map(t => ({
-            NOME_DEVEDOR:     t.nomeDevedor,
-            CPF_CNPJ_DEVEDOR: t.cpfCnpj,
-            LOGRADOURO:       t.logradouro,
-            NUMERO:           t.numero,
-            COMPLEMENTO:      '',
-            BAIRRO:           t.bairro,
-            CEP:              t.cep,
-            MUNICIPIO:        t.municipio,
-            UF:               t.uf,
-            NUMERO_TITULO:    t.numeroTitulo,
-            ESPECIE:          t.especie,
-            DATA_EMISSAO:     t.dataEmissao,
-            DATA_VENCIMENTO:  t.dataVencimento,
-            VALOR:            t.valor,
-            SALDO:            t.valor,
-            NOSSO_NUMERO:     t.numeroTitulo,
-            COMARCA:          t.comarca
+            NOME_DEVEDOR:      t.nomeDevedor,
+            CPF_CNPJ_DEVEDOR:  t.cpfCnpj,
+            LOGRADOURO:        t.logradouro,
+            NUMERO:            t.numero,
+            COMPLEMENTO:       '',
+            BAIRRO:            t.bairro,
+            CEP:               t.cep,
+            MUNICIPIO:         t.municipio,
+            UF:                t.uf,
+            NUMERO_TITULO:     t.numeroTitulo,
+            ESPECIE:           t.especie,
+            DATA_EMISSAO:      t.dataEmissao,
+            DATA_VENCIMENTO:   t.dataVencimento,
+            VALOR:             t.valor,
+            SALDO:             t.valor,
+            NOSSO_NUMERO:      t.numeroTitulo,
+            COMARCA:           t.comarca,
+            ID_APRESENTANTE:   codApres,
+            ID_CARTORIO:       idCartorio
         }));
-        const r = await axios.post(`${creds.baseUrl}/remessa`, payload, {
+        const urlRemessa = `${creds.baseUrl}/titulo${qs ? '?' + qs : ''}`;
+        console.log(`[CRA21] Enviando remessa: POST ${urlRemessa} | ${titulos.length} título(s)`);
+        const r = await axios.post(urlRemessa, payload, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
             validateStatus: () => true
         });
+        console.log(`[CRA21] Remessa status: ${r.status} | resp:`, JSON.stringify(r.data).slice(0,300));
         if (r.status >= 400) return res.json({ ok: false, erro: `CRA21 retornou ${r.status}`, data: r.data });
         console.log(`[CRA21] Remessa enviada: ${titulos.length} título(s) para ${ownerId}`);
         res.json({ ok: true, data: r.data });
@@ -953,6 +964,1026 @@ app.post('/cra21/cancelar', async (req, res) => {
         res.json({ ok: false, erro: e.message });
     }
 });
+// ============================================================
+// ROTA 17 — Upload de remessa direto ao portal web CRA21
+// ============================================================
+
+// Helper: extrai PHPSESSID dos headers set-cookie
+function extractPhpsessid(headers) {
+    for (const c of (headers['set-cookie'] || [])) {
+        const m = c.match(/PHPSESSID=([^;]+)/i);
+        if (m) return m[1];
+    }
+    return '';
+}
+
+// Helper: extrai acao (mantém URL-encoded para uso direto em URL)
+function extractAcaoRaw(str) {
+    // Da URL/Location: ?acao=XXX (captura com % para URL-encoded)
+    const mUrl = str.match(/[?&]acao=([\w+/%=]+)/);
+    if (mUrl) return mUrl[1];
+    // Do HTML: action="...?acao=XXX"
+    const mAct = str.match(/action="[^"]*[?&]acao=([\w+/%=]+)"/i);
+    if (mAct) return mAct[1];
+    // Do HTML: input name="acao" value="XXX"
+    const mInp = str.match(/<input[^>]*name="acao"[^>]*value="([\w+/%=]+)"/i)
+              || str.match(/<input[^>]*value="([\w+/%=]+)"[^>]*name="acao"/i);
+    if (mInp) return mInp[1];
+    return '';
+}
+
+// Helper: torna URL relativa em absoluta
+function toAbsolute(url, domain, portalBase) {
+    if (!url) return '';
+    if (url.startsWith('http')) return url;
+    if (url.startsWith('/')) return `${domain}${url}`;
+    return `${portalBase}/${url}`;
+}
+
+// Helper: login automático no portal CRA21 e retorna PHPSESSID
+async function cra21PortalLogin(usuario, senha, estado) {
+    const uf = (estado || 'AM').toLowerCase();
+    const domain = `https://cra${uf}.crabr.com.br`;
+    const portalBase = `${domain}/cra${uf}/site`;
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    let phpsessid = '';
+    let loginAcao = '';
+
+    // Passo 1: Tenta capturar o redirect (com maxRedirects:0)
+    // Alguns ambientes lançam erro ao receber redirect com maxRedirects:0,
+    // por isso usamos try/catch e verificamos tanto o response quanto o error.response
+    try {
+        const rootR = await axios.get(`${portalBase}/`, {
+            headers: { 'User-Agent': userAgent, 'Cookie': 'aceito-cookie=yes' },
+            validateStatus: () => true,
+            maxRedirects: 0
+        });
+        const sess = extractPhpsessid(rootR.headers);
+        if (sess) phpsessid = sess;
+        const loc = rootR.headers['location'] || rootR.headers['Location'] || '';
+        console.log(`[CRA21 Portal] root: status=${rootR.status} location="${loc.slice(0,120)}"`);
+        if (loc) loginAcao = extractAcaoRaw(loc);
+    } catch (err) {
+        // axios pode lançar erro de redirect mesmo com validateStatus
+        const resp = err.response;
+        if (resp) {
+            const sess = extractPhpsessid(resp.headers);
+            if (sess) phpsessid = sess;
+            const loc = resp.headers['location'] || resp.headers['Location'] || '';
+            console.log(`[CRA21 Portal] root(catch): status=${resp.status} location="${loc.slice(0,120)}"`);
+            if (loc) loginAcao = extractAcaoRaw(loc);
+        } else {
+            console.log(`[CRA21 Portal] root error: ${err.message}`);
+        }
+    }
+
+    // Passo 2: Se não achou o acao no redirect, segue os redirects e lê o HTML
+    if (!loginAcao) {
+        console.log('[CRA21 Portal] acao não encontrado no redirect, tentando via HTML...');
+        const pageR = await axios.get(`${portalBase}/`, {
+            headers: { 'User-Agent': userAgent, 'Cookie': `aceito-cookie=yes${phpsessid ? '; PHPSESSID=' + phpsessid : ''}` },
+            validateStatus: () => true,
+            maxRedirects: 5
+        });
+        const sess = extractPhpsessid(pageR.headers);
+        if (sess) phpsessid = sess;
+
+        // Tenta pegar acao do path final (após redirects)
+        const finalPath = pageR.request?.path || pageR.request?.res?.responseUrl || '';
+        if (finalPath) loginAcao = extractAcaoRaw(finalPath);
+
+        const html = String(pageR.data);
+        console.log(`[CRA21 Portal] page html[0..500]: ${html.slice(0, 500)}`);
+
+        if (!loginAcao) loginAcao = extractAcaoRaw(html);
+
+        if (!loginAcao) {
+            if (html.includes('menuApresentante') || html.includes('Upload remessa') || html.includes('CraMenu')) {
+                console.log('[CRA21 Portal] Já autenticado (sem redirect)');
+                return { phpsessid, portalBase };
+            }
+            throw new Error(`Portal CRA21: formulário de login não encontrado. HTML inicial: ${html.slice(0, 300)}`);
+        }
+    }
+
+    console.log(`[CRA21 Portal] loginAcao: ${loginAcao.slice(0, 40)}... | PHPSESSID: ${phpsessid.slice(0, 8)}...`);
+
+    // Passo 3: GET da página de login (com o acao) para obter sessão atualizada + nomes dos campos
+    const loginUrl = `${portalBase}/admin.php?acao=${loginAcao}`;
+    const loginPageR = await axios.get(loginUrl, {
+        headers: { 'User-Agent': userAgent, 'Cookie': `aceito-cookie=yes${phpsessid ? '; PHPSESSID=' + phpsessid : ''}` },
+        validateStatus: () => true,
+        maxRedirects: 3
+    });
+    const sess2 = extractPhpsessid(loginPageR.headers);
+    if (sess2) phpsessid = sess2;
+    const loginPageHtml = String(loginPageR.data);
+
+    const userField = (loginPageHtml.match(/<input[^>]*type="text"[^>]*name="([^"]+)"/i) || [])[1] || 'usuario';
+    const passField = (loginPageHtml.match(/<input[^>]*type="password"[^>]*name="([^"]+)"/i) || [])[1] || 'senha';
+    console.log(`[CRA21 Portal] campos form: user="${userField}" pass="${passField}"`);
+
+    // Passo 4: POST com credenciais
+    const form = new URLSearchParams();
+    form.append('NTISPOSTBACK', '1');
+    form.append('NTSUPERIORREF', `${portalBase}/`);
+    form.append(userField, usuario);
+    form.append(passField, senha);
+
+    const loginR = await axios.post(loginUrl, form.toString(), {
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+            'User-Agent': userAgent,
+            'Referer': loginUrl
+        },
+        validateStatus: () => true,
+        maxRedirects: 5
+    });
+
+    const sess3 = extractPhpsessid(loginR.headers);
+    if (sess3) phpsessid = sess3;
+
+    const loginHtml = String(loginR.data);
+    if (loginHtml.toLowerCase().includes('type="password"') && !loginHtml.includes('menuApresentante')) {
+        throw new Error('Usuário ou senha incorretos no portal CRA21.');
+    }
+
+    console.log(`[CRA21 Portal] Login OK | PHPSESSID: ${phpsessid.slice(0, 8)}...`);
+    return { phpsessid, portalBase };
+}
+
+// ── Diagnóstico: retorna HTML completo da página de upload ──
+// GET /cra21/debug-upload-html?ownerId=xxx
+app.get('/cra21/debug-upload-html', async (req, res) => {
+    const ownerId = req.query.ownerId;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+
+        let phpsessid = creds.phpsessid || '';
+        if (!phpsessid) {
+            const r = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = r.phpsessid;
+        }
+
+        const UPLOAD_ACAO = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`;
+
+        const pageR = await axios.get(uploadUrl, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 3
+        });
+        const pageHtml = String(pageR.data);
+
+        // Extrai scripts inline que contenham fileupload/remessa
+        const inlineScripts = [];
+        const inlineRe = /<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+        let im;
+        while ((im = inlineRe.exec(pageHtml)) !== null) {
+            const c = im[1].trim();
+            if (c.length > 5) inlineScripts.push(c);
+        }
+
+        return res.json({
+            ok: true,
+            status: pageR.status,
+            htmlSize: pageHtml.length,
+            html: pageHtml,                    // HTML COMPLETO
+            inlineScripts,                     // todos os scripts inline
+            inlineScriptsWithUpload: inlineScripts.filter(s => /fileupload|remessa|upload/i.test(s))
+        });
+    } catch (e) {
+        return res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ── Diagnóstico: retorna conteúdo dos JS chave do portal CRA21 ──
+// GET /cra21/debug-js?ownerId=xxx
+app.get('/cra21/debug-js', async (req, res) => {
+    const ownerId = req.query.ownerId;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const baseUrl = `https://cra${uf}.crabr.com.br`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+
+        let phpsessid = creds.phpsessid || '';
+        if (!phpsessid) {
+            const r = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = r.phpsessid;
+        }
+
+        // ── Busca a página de upload primeiro (para extrair script tags reais) ──
+        const UPLOAD_ACAO_DISPLAY_DBG = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        const uploadUrlDbg = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_DISPLAY_DBG}`;
+        const pageR = await axios.get(uploadUrlDbg, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 3
+        });
+        const pageHtml = String(pageR.data);
+
+        const results = {};
+        results['_uploadPageHtml'] = {
+            status: pageR.status,
+            size: pageHtml.length,
+            content: pageHtml   // retorna HTML COMPLETO para análise
+        };
+
+        // ── Extrai TODOS os <script src="..."> da página de upload ──
+        const allSrcs = [];
+        const srcRe = /src=["']([^"']+\.js[^"']*)["']/gi;
+        let sm9;
+        while ((sm9 = srcRe.exec(pageHtml)) !== null) allSrcs.push(sm9[1]);
+        results['_scriptTags'] = allSrcs;
+
+        // ── Filtra JS de interesse (não libs genéricas) ──
+        const interestingSrcs = allSrcs.filter(src =>
+            /cra\.js|CraVisao|CraApresentante|scripts\.js/i.test(src) &&
+            !/sislib21|Lib21|jquery|maskedinput|ie-fix|Assinatura|Relogio|Relatorio|RestPki|GoogleAnalytics|Remarketing|quick-sidebar|Md5|AcessoLogin/i.test(src)
+        );
+        // Fallback: se não encontrou nada específico, pega os 5 primeiros não-lib
+        const jsSrcs = interestingSrcs.length > 0 ? interestingSrcs
+            : allSrcs.filter(s => !/sislib21|jquery|GoogleAnalytics|Remarketing|Md5/i.test(s)).slice(0, 5);
+        results['_jsAlvo'] = jsSrcs;
+
+        // ── Busca conteúdo de cada JS alvo ──
+        // path correto: /{uf}/site/js/... (não /cra/site/js/)
+        for (const relSrc of jsSrcs.slice(0, 8)) {
+            try {
+                // Resolve URL completa: absoluta, relativa ao domínio, ou relativa ao path
+                let fullUrl;
+                if (relSrc.startsWith('http')) {
+                    fullUrl = relSrc;
+                } else if (relSrc.startsWith('/')) {
+                    fullUrl = `${baseUrl}${relSrc}`;
+                } else {
+                    // relativo ao portalBase (/craam/site/)
+                    fullUrl = `${portalBase}/${relSrc.replace(/^\.\.\//, '').replace(/^\//, '')}`;
+                }
+                const jsR = await axios.get(fullUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 20000
+                });
+                const jsC = String(jsR.data);
+                results[relSrc.split('/').pop().split('?')[0]] = {
+                    status: jsR.status,
+                    size: jsC.length,
+                    url: fullUrl,
+                    content: jsC   // conteúdo COMPLETO — sem truncamento
+                };
+            } catch (e2) {
+                results[relSrc.split('/').pop().split('?')[0]] = { error: e2.message };
+            }
+        }
+
+        // ── Sempre busca cra.js e CraVisaoPaginaAdm.js com path correto ──
+        const fixedJs = [
+            `${baseUrl}/cra${uf}/site/js/common/cra.js`,
+            `${baseUrl}/cra${uf}/site/js/CraVisaoPaginaAdm.js`,
+            `${baseUrl}/cra${uf}/site/js/scripts.js`,
+        ];
+        for (const url of fixedJs) {
+            const key = url.split('/').pop().split('?')[0];
+            if (results[key]) continue;   // já foi buscado acima
+            try {
+                const r = await axios.get(url, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 20000
+                });
+                results[key] = { status: r.status, size: String(r.data).length, url, content: String(r.data) };
+            } catch (e3) {
+                results[key] = { error: e3.message };
+            }
+        }
+
+        return res.json({ ok: true, phpsessid: phpsessid.slice(0,8)+'...', results });
+    } catch (e) {
+        return res.json({ ok: false, erro: e.message });
+    }
+});
+
+app.post('/cra21/upload-portal', async (req, res) => {
+    const { ownerId, arquivoBase64, nomeArquivo } = req.body;
+    if (!ownerId || !arquivoBase64)
+        return res.json({ ok: false, erro: 'ownerId e arquivoBase64 obrigatórios' });
+
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+        // acao do Sis21 é PHP serializado em base64.
+        // tipoFuncao=2 → EXIBIÇÃO da página (GET — retorna o HTML com o form)
+        // tipoFuncao=1 → PROCESSAMENTO da ação (POST — onde o form envia os dados)
+        // Nosso erro histórico: sempre postávamos para tipoFuncao=2 (display),
+        // que valida o login widget. O POST correto vai para tipoFuncao=1 (action).
+        const UPLOAD_ACAO_DISPLAY = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        // tipoFuncao=1: mesma ação, função de processamento (i:2 → i:1 no PHP serializado)
+        const UPLOAD_ACAO_ACTION = creds.uploadAcaoAction ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6MTt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+
+        // Tenta sessão armazenada; se expirada, faz login
+        let phpsessid = creds.phpsessid || '';
+        let needsLogin = !phpsessid;
+
+        // GET da página usa tipoFuncao=2 (display); POST do upload usa tipoFuncao=1 (action)
+        const uploadUrl     = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_DISPLAY}`;
+        const uploadPostUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_ACTION}`;
+
+        // Testa sessão: verifica se a página de upload está acessível (título correto)
+        if (phpsessid) {
+            const testR = await axios.get(uploadUrl, {
+                headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                validateStatus: () => true, maxRedirects: 3
+            });
+            const testHtml = String(testR.data);
+            // Sessão é VÁLIDA se a página de upload for retornada (título contém "Upload remessa")
+            // INVÁLIDA se o título for só "CRA" ou vier redirect
+            const isUploadPage = testHtml.includes('Upload remessa') || testHtml.includes('enviarRemessa');
+            needsLogin = !isUploadPage;
+            console.log(`[CRA21 Portal] Teste sessão: ${isUploadPage ? 'válida' : 'expirada'}`);
+        }
+
+        if (needsLogin) {
+            console.log(`[CRA21 Portal] Sessão inválida — fazendo login automático...`);
+            const result = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = result.phpsessid;
+            await db.collection('settings').doc(ownerId).update({ 'cra21.phpsessid': phpsessid });
+        }
+
+        // GET da página de upload para capturar campos e analisar formulário
+        const uploadPageR = await axios.get(uploadUrl, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 3
+        });
+        const uploadPageHtml = String(uploadPageR.data);
+
+        // ── Log do corpo da página para encontrar onde fileupload é configurado ──
+        const fuInPageIdx = uploadPageHtml.toLowerCase().indexOf('fileupload');
+        if (fuInPageIdx >= 0) {
+            console.log(`[CRA21 Portal] uploadPage HTML[fileupload@${fuInPageIdx}]: ${uploadPageHtml.slice(Math.max(0,fuInPageIdx-200), fuInPageIdx+800)}`);
+        } else {
+            console.log(`[CRA21 Portal] "fileupload" NÃO encontrado no HTML da página`);
+            // Log das seções do body para análise
+            console.log(`[CRA21 Portal] uploadPage HTML[3000..6000]: ${uploadPageHtml.slice(3000, 6000)}`);
+            console.log(`[CRA21 Portal] uploadPage HTML[6000..10000]: ${uploadPageHtml.slice(6000, 10000)}`);
+        }
+        // Confirma se enviarRemessa está no HTML estático
+        const envInPage = uploadPageHtml.indexOf('enviarRemessa');
+        console.log(`[CRA21 Portal] "enviarRemessa" no HTML estático: ${envInPage >= 0 ? `sim @${envInPage} => ${uploadPageHtml.slice(Math.max(0,envInPage-300), envInPage+300)}` : 'NÃO — form é dinâmico'}`);
+
+        // ── Extrai e loga script src's (compacto, não trunca nos logs do Railway) ──
+        const allScriptSrcList = [];
+        { const re = /src=["']([^"']+\.js[^"']*)["']/gi; let m2;
+          while ((m2 = re.exec(uploadPageHtml)) !== null) allScriptSrcList.push(m2[1]); }
+        console.log(`[CRA21 Portal] Scripts incluídos: ${JSON.stringify(allScriptSrcList)}`);
+
+        // ── Busca URL do upload: 1) scripts inline, 2) JS externos específicos ──
+        // O jQuery File Upload é configurado com: $('#fileupload').fileupload({ url: '...' })
+        // Pode estar num <script> inline na página OU num JS externo específico.
+        // NOTA: cra.js tem fileupload para PoliticasDePrivacidade — filtrar essa URL.
+
+        let discoveredUploadUrl = null;
+        const baseUrlJs = `https://cra${uf}.crabr.com.br`;
+
+        // Helper: verifica se URL candidata é de upload de remessa (não política/privacidade)
+        const isUploadUrl = (url) =>
+            url && !/politica|privacy|cookie|acesso|login/i.test(url);
+
+        // ── 1) Busca em <script> INLINE da página ──
+        const inlineScriptRe = /<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+        let inlineM;
+        while ((inlineM = inlineScriptRe.exec(uploadPageHtml)) !== null) {
+            const cnt = inlineM[1];
+            if (!/fileupload|remessa|upload/i.test(cnt)) continue;
+            console.log(`[CRA21 Portal] Script inline relevante (fileupload/remessa): ${cnt.slice(0, 800)}`);
+            const m =
+                cnt.match(/fileupload\s*\(\s*\{[\s\S]{0,400}?url\s*:\s*["']([^"']+)["']/i) ||
+                cnt.match(/url\s*:\s*["']([^"']*admin\.php[^"']*)["']/i) ||
+                cnt.match(/(?:url|action)\s*:\s*["']([^"']*acao=[^"']+)["']/i);
+            if (m && isUploadUrl(m[1])) {
+                discoveredUploadUrl = m[1];
+                console.log(`[CRA21 Portal] ✓ URL encontrada em script inline: ${discoveredUploadUrl}`);
+                break;
+            }
+        }
+
+        // ── 2) Busca em JS externos (filtra libs genéricas, prioriza específicos de remessa) ──
+        if (!discoveredUploadUrl) {
+            const pageSpecificSrcs = allScriptSrcList.filter(s =>
+                /CraApresentante|Remessa|Upload|CraVisaoPagina/i.test(s) &&
+                !/sislib21|Lib21|jquery|ie-fix|maskedinput|AcessoLogin|Assinatura|Relogio/i.test(s)
+            );
+            // Adiciona cra.js como fallback no final (tem fileupload mas pode ser URL errada)
+            const craJs = allScriptSrcList.find(s => /\/cra\.js/i.test(s));
+            if (craJs && !pageSpecificSrcs.includes(craJs)) pageSpecificSrcs.push(craJs);
+
+            console.log(`[CRA21 Portal] JS específico da página: ${JSON.stringify(pageSpecificSrcs)}`);
+
+            for (const relSrc of pageSpecificSrcs.slice(0, 8)) {
+                let fullJsUrl;
+                if (relSrc.startsWith('http')) fullJsUrl = relSrc;
+                else if (relSrc.startsWith('/')) fullJsUrl = `${baseUrlJs}${relSrc}`;
+                else {
+                    const clean = relSrc.replace(/^(\.\.\/)+/, '/');
+                    fullJsUrl = `${baseUrlJs}${clean}`;
+                }
+                try {
+                    const jsR2 = await axios.get(fullJsUrl, {
+                        headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                        validateStatus: () => true, timeout: 15000
+                    });
+                    const jsC2 = String(jsR2.data);
+                    const jsName = relSrc.split('/').pop().split('?')[0];
+                    console.log(`[CRA21 Portal] JS ${jsName} size=${jsC2.length}`);
+
+                    // Procura TODAS as ocorrências de fileupload+url no JS e filtra política
+                    const allUrlMatches = [];
+                    const reFU = /fileupload\s*\(\s*\{[\s\S]{0,400}?url\s*:\s*["']([^"']+)["']/gi;
+                    let mFU;
+                    while ((mFU = reFU.exec(jsC2)) !== null) allUrlMatches.push(mFU[1]);
+                    const reAdmin = /url\s*:\s*["']([^"']*admin\.php[^"']*)["']/gi;
+                    let mA;
+                    while ((mA = reAdmin.exec(jsC2)) !== null) allUrlMatches.push(mA[1]);
+                    const reAcao = /(?:url|action)\s*:\s*["']([^"']*acao=[^"']+)["']/gi;
+                    let mAc;
+                    while ((mAc = reAcao.exec(jsC2)) !== null) allUrlMatches.push(mAc[1]);
+
+                    // Busca MAIS AMPLA: qualquer URL PHP mencionada no JS
+                    const reAnyPhp = /["']([^"']*\.php[^"']*)["']/gi;
+                    let mAny;
+                    const phpUrls = [];
+                    while ((mAny = reAnyPhp.exec(jsC2)) !== null) phpUrls.push(mAny[1]);
+                    const phpUploadUrls = phpUrls.filter(u => /[Rr]emessa|[Uu]pload|[Aa]rquivo|CraAjax/i.test(u));
+                    if (phpUploadUrls.length > 0) {
+                        console.log(`[CRA21 Portal] ${jsName}: PHP URLs com remessa/upload: ${JSON.stringify(phpUploadUrls)}`);
+                    }
+
+                    // Log de trechos do JS que mencionalm 'remessa' ou 'upload' (para cra.js)
+                    if (jsName === 'cra.js') {
+                        const lowJs = jsC2.toLowerCase();
+                        let searchIdx = 0;
+                        let remCount = 0;
+                        while (remCount < 5) {
+                            const pos = lowJs.indexOf('remessa', searchIdx);
+                            if (pos < 0) break;
+                            console.log(`[CRA21 Portal] cra.js[remessa@${pos}]: ${jsC2.slice(Math.max(0,pos-150), pos+250)}`);
+                            searchIdx = pos + 1;
+                            remCount++;
+                        }
+                        let upCount = 0;
+                        searchIdx = 0;
+                        while (upCount < 3) {
+                            const pos2 = lowJs.indexOf('fileupload', searchIdx);
+                            if (pos2 < 0) break;
+                            console.log(`[CRA21 Portal] cra.js[fileupload@${pos2}]: ${jsC2.slice(Math.max(0,pos2-50), pos2+400)}`);
+                            searchIdx = pos2 + 1;
+                            upCount++;
+                        }
+                    }
+
+                    const validUrl = allUrlMatches.find(isUploadUrl);
+                    if (validUrl) {
+                        discoveredUploadUrl = validUrl;
+                        console.log(`[CRA21 Portal] ✓ URL de upload encontrada em ${jsName}: ${discoveredUploadUrl}`);
+                        break;
+                    } else if (allUrlMatches.length > 0) {
+                        console.log(`[CRA21 Portal] ${jsName}: URLs encontradas mas todas filtradas: ${JSON.stringify(allUrlMatches)}`);
+                    } else {
+                        console.log(`[CRA21 Portal] JS snippet ${jsName}: ${jsC2.slice(0, 400)}`);
+                    }
+                } catch (eJs) {
+                    console.log(`[CRA21 Portal] Erro ao buscar JS ${relSrc}: ${eJs.message}`);
+                }
+            }
+        }
+
+        // Campos que NÃO devemos incluir no POST de upload:
+        // - NTISPOSTBACK, NTSUPERIORREF, acao, PHPSESSID: gerenciados manualmente ou via URL
+        // - login, senha, code: quando a sessão PHP é válida, o JS do portal
+        //   (CraVisaoAcessoLogin.js) desabilita/remove esses campos antes do submit,
+        //   então eles NÃO são enviados. Mandá-los (mesmo vazios) faz o Sis21 tentar
+        //   autenticar e falhar com "Código inválido!" ou processar login em vez do upload.
+        const skipFields = new Set(['NTISPOSTBACK', 'NTSUPERIORREF', 'acao', 'PHPSESSID', 'login', 'senha', 'code']);
+
+        // Extrai campos hidden da página (exceto os já gerenciados)
+        const hiddenFields = [];
+        const hiddenRe = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
+        let hm;
+        while ((hm = hiddenRe.exec(uploadPageHtml)) !== null) {
+            const n = hm[1], v = hm[2];
+            if (!skipFields.has(n)) hiddenFields.push({ n, v });
+        }
+        const hiddenRe2 = /<input[^>]*type="hidden"[^>]*value="([^"]*)"[^>]*name="([^"]+)"[^>]*>/gi;
+        const found = new Set(hiddenFields.map(h => h.n));
+        while ((hm = hiddenRe2.exec(uploadPageHtml)) !== null) {
+            const n = hm[2], v = hm[1];
+            if (!skipFields.has(n) && !found.has(n)) hiddenFields.push({ n, v });
+        }
+
+        // Extrai selects com valor selecionado (campos obrigatórios tipo "tipo de remessa")
+        const selectRe = /<select[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/gi;
+        const selectFields = [];
+        let sm;
+        while ((sm = selectRe.exec(uploadPageHtml)) !== null) {
+            const selName = sm[1];
+            if (skipFields.has(selName)) continue;
+            // Pega option com selected, ou o primeiro option com valor
+            const selOpt = sm[2].match(/<option[^>]*selected[^>]*value="([^"]*)"/i)
+                        || sm[2].match(/<option[^>]*value="([^"]+)"/i);
+            selectFields.push({ n: selName, v: selOpt ? selOpt[1] : '' });
+        }
+
+        // Nome do campo file e valor do botão submit
+        const fileFieldM = uploadPageHtml.match(/<input[^>]*type="file"[^>]*name="([^"]+)"/i)
+                        || uploadPageHtml.match(/<input[^>]*name="([^"]+)"[^>]*type="file"/i);
+        const fileField = fileFieldM ? fileFieldM[1] : 'enviarRemessa';
+
+        const submitM = uploadPageHtml.match(/<input[^>]*type="submit"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/i)
+                     || uploadPageHtml.match(/<button[^>]*type="submit"[^>]*name="([^"]+)"[^>]*>([^<]+)<\/button>/i);
+        const submitName  = submitM ? submitM[1] : 'enviar';
+        const submitValue = submitM ? submitM[2].trim() : 'Enviar';
+
+        // ═══════════════════════════════════════════════════════════
+        // CRÍTICO: Extrai o action do formulário de upload da HTML
+        // O acao de exibição (tipoFuncao=2) é para GET.
+        // O <form action="..."> pode conter tipoFuncao=1 para processar.
+        // Usar a URL errada faz Sis21 chamar apresentar() em vez de processar().
+        // ═══════════════════════════════════════════════════════════
+        let formPostUrl = uploadUrl;  // fallback
+
+        // Tenta encontrar o <form> que contém o campo enviarRemessa e pegar seu action
+        const formHtmlM = uploadPageHtml.match(/<form(?:[^>]*)>([\s\S]{0,6000}?)<\/form>/gi) || [];
+        let uploadFormHtml = '';
+        for (const fh of formHtmlM) {
+            if (/enviarRemessa/i.test(fh)) { uploadFormHtml = fh; break; }
+        }
+        if (!uploadFormHtml) {
+            // Fallback: pega o form mais próximo antes de enviarRemessa
+            const idx = uploadPageHtml.indexOf('enviarRemessa');
+            if (idx >= 0) {
+                const before = uploadPageHtml.slice(Math.max(0, idx - 2000), idx);
+                const lastForm = before.lastIndexOf('<form');
+                if (lastForm >= 0) uploadFormHtml = before.slice(lastForm);
+            }
+        }
+
+        const formActionM = uploadFormHtml.match(/<form[^>]*\baction="([^"]+)"/i)
+                         || uploadPageHtml.match(/<form[^>]*\baction="([^"]*admin\.php[^"]+)"/i);
+        if (formActionM) {
+            const rawAction = formActionM[1].replace(/&amp;/g, '&');
+            if (rawAction.startsWith('http')) {
+                formPostUrl = rawAction;
+            } else if (rawAction.startsWith('/')) {
+                formPostUrl = `https://cra${uf}.crabr.com.br${rawAction}`;
+            } else {
+                // URL relativa — resolve a partir da base do portal
+                formPostUrl = `${portalBase}/${rawAction.replace(/^\.\.\//, '').replace(/^\.\//, '')}`;
+            }
+            console.log(`[CRA21 Portal] ✓ Form action extraído: ${formPostUrl.slice(0, 150)}`);
+        } else {
+            console.log(`[CRA21 Portal] ⚠ Form action NÃO encontrado — usando uploadUrl como fallback`);
+            // Loga o HTML em volta de enviarRemessa para diagnóstico
+            const envIdx = uploadPageHtml.indexOf('enviarRemessa');
+            if (envIdx >= 0) {
+                console.log(`[CRA21 Portal] HTML[enviarRemessa-600..+100]: ${uploadPageHtml.slice(Math.max(0, envIdx-600), envIdx+100)}`);
+            }
+        }
+
+        // Busca CraVisaoAcessoLogin.js para detectar campo "code" injetado por JS
+        try {
+            const loginJsSrc = allScriptSrcList.find(s => /AcessoLogin/i.test(s));
+            if (loginJsSrc) {
+                let loginJsUrl = loginJsSrc.startsWith('http') ? loginJsSrc
+                    : loginJsSrc.startsWith('/') ? `https://cra${uf}.crabr.com.br${loginJsSrc}`
+                    : `https://cra${uf}.crabr.com.br/${loginJsSrc.replace(/^(\.\.\/)+/, '')}`;
+                const loginJsR = await axios.get(loginJsUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 12000
+                });
+                const loginJsContent = String(loginJsR.data);
+                // Loga trechos relevantes: campos adicionados ao formulário, code, NTISPOSTBACK
+                const loginJsRelevant = loginJsContent.match(/(?:\.val\(|\.append\(|\.prepend\(|code|NTIS|\.submit|enviar|upload|remessa)[^;]{0,200}/gi) || [];
+                console.log(`[CRA21 Portal] CraVisaoAcessoLogin.js size=${loginJsContent.length} | trechos relevantes: ${JSON.stringify(loginJsRelevant.slice(0, 10))}`);
+                // Verifica se o JS injeta um campo 'code'
+                if (/['"]\s*code\s*['"]|name\s*=\s*['"]code['"]/i.test(loginJsContent)) {
+                    console.log(`[CRA21 Portal] ⚠ CraVisaoAcessoLogin.js MENCIONA campo "code" — pode ser necessário`);
+                }
+            }
+        } catch (eLogin) {
+            console.log(`[CRA21 Portal] Erro ao buscar CraVisaoAcessoLogin.js: ${eLogin.message}`);
+        }
+
+        console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}" | formPostUrl: ${formPostUrl.slice(-80)}`);
+
+        // Monta multipart/form-data manualmente
+        const fileBuffer = Buffer.from(arquivoBase64, 'base64');
+        const nome = nomeArquivo || 'remessa.xlsx';
+
+        // Extrai valor do campo tipoRemessa/tipo da página (select ou hidden na HTML)
+        // A página retorna login widget em HTML cru, mas pode ter hidden fields ou inline JS
+        let tipoRemessaVal = '1';  // default: tipo 1 (remessa padrão apresentante)
+        const tipoRemOpts = uploadPageHtml.match(/name="(?:tipoRemessa|tipo_remessa|tipoEnvio)[^"]*"[^>]*value="([^"]*)"/i);
+        if (tipoRemOpts) tipoRemessaVal = tipoRemOpts[1];
+        // Tenta encontrar no inline JS (ex: tipoRemessa: "01" ou value: '01')
+        const tipoRemJs = uploadPageHtml.match(/tipoRemessa['":\s]+['"](\w+)['"]/i);
+        if (tipoRemJs) tipoRemessaVal = tipoRemJs[1];
+
+        console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | tipoRemessa="${tipoRemessaVal}" | PHPSESSID: ${phpsessid.slice(0,8)}...`);
+
+        // Função auxiliar para montar multipart
+        const buildMultipart = (bnd, fields, fileFld, fileName, fileBuf) => {
+            const mk = (name, val) => Buffer.from(
+                `--${bnd}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${val}\r\n`, 'utf-8');
+            const parts = fields.map(([n, v]) => mk(n, v));
+            parts.push(Buffer.from(
+                `--${bnd}\r\nContent-Disposition: form-data; name="${fileFld}"; filename="${fileName}"\r\n` +
+                `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'));
+            parts.push(fileBuf);
+            parts.push(Buffer.from(`\r\n--${bnd}--\r\n`, 'utf-8'));
+            return Buffer.concat(parts);
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // Monta corpo multipart EXATAMENTE como o browser faz (cURL capturado)
+        // Campos obrigatórios descobertos do request real:
+        //   NTISPOSTBACK=1, NTSUPERIORREF=<url_pagina_origem>, enviarRemessa=<arquivo>, enviar=""
+        // IMPORTANTE: browser NÃO envia X-Requested-With (é form submit normal, não AJAX)
+        // ═══════════════════════════════════════════════════════════════
+
+        // NTSUPERIORREF: URL da página de origem.
+        // Usamos o uploadUrl (página de display) como origem — é de lá que o usuário submete o form.
+        const ntsuperiorref = creds.ntsuperiorref || uploadUrl;
+
+        // ═══════════════════════════════════════════════════════════════════
+        // TENTATIVA A: Upload via XHR/AJAX (jQuery File Upload envia sem NTISPOSTBACK)
+        // Se a página carrega o formulário dinamicamente via JS, o POST correto é XHR,
+        // não form submit. Resultado esperado: JSON, não HTML.
+        // ═══════════════════════════════════════════════════════════════════
+        const bndAjax = `----WebKitFormBoundary${Date.now()}`;
+        // Apenas o arquivo — sem campos Sis21 (NTISPOSTBACK/NTSUPERIORREF)
+        const bodyAjax = buildMultipart(bndAjax, [], fileField, nome, fileBuffer);
+        const mobileUA = 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36';
+        console.log(`[CRA21 Portal] TENTATIVA A — XHR: POST somente arquivo → ${formPostUrl.slice(-80)}`);
+        const uploadAjax = await axios.post(formPostUrl, bodyAjax, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${bndAjax}`,
+                'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                'User-Agent': mobileUA,
+                'Referer': uploadUrl,
+                'Origin': `https://cra${uf}.crabr.com.br`,
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Accept-Language': 'pt-BR,pt;q=0.9',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+            },
+            validateStatus: () => true,
+            maxRedirects: 5,
+        });
+        const htmlA = String(uploadAjax.data);
+        const ctA = (uploadAjax.headers['content-type'] || '').toLowerCase();
+        console.log(`[CRA21 Portal] TENTATIVA A status=${uploadAjax.status} ct="${ctA}" size=${htmlA.length}`);
+        console.log(`[CRA21 Portal] TENTATIVA A body[0..600]: ${htmlA.slice(0, 600)}`);
+
+        // Se a resposta for JSON → o upload funciona via AJAX! Analisa e retorna.
+        if (ctA.includes('json') || htmlA.trimStart().startsWith('{') || htmlA.trimStart().startsWith('[')) {
+            try {
+                const jsonA = typeof uploadAjax.data === 'object' ? uploadAjax.data : JSON.parse(htmlA);
+                console.log(`[CRA21 Portal] TENTATIVA A JSON: ${JSON.stringify(jsonA)}`);
+                const isOkA = jsonA.ok === true || jsonA.success === true || jsonA.status === 'ok'
+                           || (Array.isArray(jsonA) && jsonA[0]?.name) || jsonA.result === 'ok';
+                const erroA = jsonA.error || jsonA.erro || jsonA.message || jsonA.mensagem || '';
+                if (isOkA && !erroA) return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
+                if (erroA) return res.json({ ok: false, erro: String(erroA) });
+                console.log(`[CRA21 Portal] TENTATIVA A JSON não reconhecido — assumindo sucesso`);
+                return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
+            } catch (e) { console.log(`[CRA21 Portal] TENTATIVA A JSON parse falhou: ${e.message}`); }
+        }
+
+        // Se TENTATIVA A retornou HTML DIFERENTE do HTML padrão de 24402 → interessante, loga mais
+        if (htmlA.length !== 24402) {
+            console.log(`[CRA21 Portal] ⚠ TENTATIVA A retornou HTML diferente (${htmlA.length} chars)! Pode ser resposta útil.`);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // TENTATIVA B: Upload via form submit com NTISPOSTBACK (cURL capturado)
+        // ═══════════════════════════════════════════════════════════════════
+        const bndMain = `----WebKitFormBoundary${Date.now()}`;
+        const bodyMain = buildMultipart(bndMain, [
+            ['NTISPOSTBACK', '1'],
+            ['NTSUPERIORREF', ntsuperiorref],
+            ['enviar', '']              // valor VAZIO (conforme cURL real — não "Enviar")
+        ], fileField, nome, fileBuffer);
+
+        console.log(`[CRA21 Portal] TENTATIVA B — form submit: POST com NTISPOSTBACK → ${formPostUrl.slice(-80)}`);
+        let uploadR = await axios.post(formPostUrl, bodyMain, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${bndMain}`,
+                'Content-Length': bodyMain.length,
+                'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                'User-Agent': mobileUA,
+                'Referer': uploadUrl,
+                'Origin': `https://cra${uf}.crabr.com.br`,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1'
+            },
+            validateStatus: () => true,
+            maxRedirects: 5
+        });
+        const uploadRespRaw = uploadR.data;
+        const uploadRespHtml = String(uploadRespRaw);
+        console.log(`[CRA21 Portal] TENTATIVA B status=${uploadR.status} size=${uploadRespHtml.length} ct="${uploadR.headers['content-type']||'?'}" url=${String(uploadR.request?.res?.responseUrl || uploadR.config?.url).slice(-80)}`);
+        console.log(`[CRA21 Portal] TENTATIVA B body[0..800]: ${uploadRespHtml.slice(0, 800)}`);
+
+        // ── Trata resposta JSON (retorno de endpoint AJAX) ──
+        const contentType = (uploadR.headers['content-type'] || '').toLowerCase();
+        if (contentType.includes('json') || (uploadRespHtml.trimStart().startsWith('{') || uploadRespHtml.trimStart().startsWith('['))) {
+            try {
+                const jsonResp = typeof uploadRespRaw === 'object' ? uploadRespRaw : JSON.parse(uploadRespHtml);
+                console.log(`[CRA21 Portal] Resposta JSON: ${JSON.stringify(jsonResp)}`);
+                // Detecta sucesso/erro pela resposta JSON
+                const isOk = jsonResp.ok === true || jsonResp.success === true || jsonResp.status === 'ok'
+                          || jsonResp.result === 'ok' || (Array.isArray(jsonResp) && jsonResp[0]?.name);
+                const erroJ = jsonResp.error || jsonResp.erro || jsonResp.message || jsonResp.mensagem || '';
+                if (isOk && !erroJ) {
+                    console.log(`[CRA21 Portal] Upload AJAX bem-sucedido — JSON OK`);
+                    return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
+                }
+                if (erroJ) {
+                    return res.json({ ok: false, erro: String(erroJ) });
+                }
+                // Resposta JSON não reconhecida → loga e trata como sucesso (resposta vazia = sem erro)
+                console.log(`[CRA21 Portal] JSON não reconhecido — assumindo sucesso: ${JSON.stringify(jsonResp)}`);
+                return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
+            } catch (e) {
+                console.log(`[CRA21 Portal] Falha ao parsear JSON: ${e.message} | raw: ${uploadRespHtml.slice(0,500)}`);
+            }
+        }
+
+        // Log em partes para ver o HTML completo nos logs
+        const erroBruto = uploadRespHtml.match(/(?:alert|mensagem|msg|erro|required|obrigat|campo|padr|febraban|duplic|j[aá]\s+(?:foi|existe|envi))[^<]{0,300}/gi) || [];
+        console.log(`[CRA21 Portal] Textos relevantes no HTML: ${JSON.stringify(erroBruto.slice(0,8))}`);
+        const htmlParts = uploadRespHtml.length;
+        console.log(`[CRA21 Portal] HTML total: ${htmlParts} chars`);
+        console.log(`[CRA21 Portal] HTML[0..3000]: ${uploadRespHtml.slice(0,3000)}`);
+        if (htmlParts > 3000) console.log(`[CRA21 Portal] HTML[3000..6000]: ${uploadRespHtml.slice(3000,6000)}`);
+        if (htmlParts > 6000) console.log(`[CRA21 Portal] HTML[6000..9000]: ${uploadRespHtml.slice(6000,9000)}`);
+
+        const htmlR = uploadRespHtml;
+        const strip = s => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+        if (uploadR.status >= 400) {
+            return res.json({ ok: false, erro: `Portal CRA21 retornou status ${uploadR.status}` });
+        }
+
+        // Verifica se a sessão expirou (voltou para a página de login)
+        const isLoginPage = htmlR.includes('esqueceu a senha');
+        if (isLoginPage) {
+            return res.json({ ok: false, erro: 'Sessão CRA21 expirou durante o upload. Tente novamente.' });
+        }
+
+        // Detecta redirecionamento para CraHome (home do portal = sucesso)
+        const finalUrl = (uploadR.request?.res?.responseUrl || uploadR.config?.url || '');
+        const redirectedToHome = finalUrl.includes('CraHome') ||
+                                 htmlR.includes('"CraHome"') ||
+                                 (htmlR.includes('CraRelogio') && !htmlR.includes('enviarRemessa'));
+
+        // Verifica se ainda está na página de upload (formulário presente e não é home = possível erro)
+        const stillUploadPage = !redirectedToHome && (htmlR.includes('Upload remessa') || htmlR.includes('enviarRemessa'));
+
+        // Padrões de ERRO (só verificamos erros na própria página de upload)
+        const erroPatterns = [
+            /class="[^"]*(?:alert-danger|bg-danger|text-danger|mensagem-erro|msg-erro)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
+            /<(?:div|p|span)[^>]*id="[^"]*(?:erro|error|msg)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span)>/i,
+            /C[oó]digo inv[aá]lido[^<]{0,200}/i,
+            /Informar os campos[^<]{0,200}/i,
+            /O nome do arquivo[^<]{0,200}/i,
+            /Padr[aã]o Febraban[^<]{0,200}/i,
+            /arquivo j[aá] foi[^<]{0,200}/i,
+            /j[aá] existe[^<]{0,200}/i,
+            /duplicad[oa][^<]{0,200}/i,
+        ];
+
+        let erroMsg = '';
+        for (const p of erroPatterns) {
+            const m = htmlR.match(p);
+            if (m) { erroMsg = strip(m[1] || m[0]); break; }
+        }
+
+        console.log(`[CRA21 Portal] erroMsg="${erroMsg}" | stillUploadPage=${stillUploadPage} | redirectedToHome=${redirectedToHome} | finalUrl=${finalUrl.slice(-60)}`);
+
+        // Se redirecionou para a home sem erro → SUCESSO (comportamento normal do portal CRA21)
+        if (redirectedToHome && !erroMsg) {
+            console.log(`[CRA21 Portal] Upload bem-sucedido — portal redirecionou para CraHome`);
+            return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
+        }
+
+        // Se encontrou mensagem de erro clara → falhou
+        if (erroMsg) {
+            return res.json({ ok: false, erro: erroMsg });
+        }
+
+        // Se ainda está na página de upload E não há mensagem de erro detectável → erro não detectado
+        if (stillUploadPage) {
+            const textoCompleto = strip(htmlR);
+            const msgGenerica = (
+                htmlR.match(/class="[^"]*(?:alert|aviso|warning|notice|mensagem|message)[^"]*"[^>]*>([\s\S]{1,500}?)<\/(?:div|p|span|td)>/i)?.[1] ||
+                ''
+            );
+            const msgLimpa = msgGenerica ? strip(msgGenerica) : '';
+            const meio = textoCompleto.slice(200, 800);
+            console.log(`[CRA21 Portal] Formulário ainda visível. Msg genérica: "${msgLimpa}" | Meio: "${meio}"`);
+            const erroFinal = msgLimpa || meio.slice(0, 300) || textoCompleto.slice(0, 300);
+            return res.json({ ok: false, erro: `Portal rejeitou o arquivo. Detalhes: "${erroFinal.slice(0,400)}"` });
+        }
+
+        // Caso genérico: não está na página de upload e não tem erro → SUCESSO
+        console.log(`[CRA21 Portal] Upload aceito — portal saiu da página de upload`);
+        return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
+
+    } catch (e) {
+        console.error('[CRA21 Portal] Erro:', e.message);
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// CRA21: Cancelar protesto de títulos individualmente
+// ─────────────────────────────────────────────────────────────
+app.post('/cra21/cancelar-protesto', async (req, res) => {
+    const { ownerId, titulos } = req.body;
+    // titulos: [{ id, cpfCnpj, nomeDevedor, nossoNumero }]
+    if (!ownerId || !titulos?.length)
+        return res.json({ ok: false, erro: 'ownerId e titulos obrigatórios' });
+
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+        // Sessão válida?
+        let phpsessid = creds.phpsessid || '';
+        let needsLogin = !phpsessid;
+        const UPLOAD_ACAO = creds.uploadAcao || 'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        if (phpsessid) {
+            const testR = await axios.get(`${portalBase}/admin.php?acao=${UPLOAD_ACAO}`, {
+                headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                validateStatus: () => true, maxRedirects: 3
+            });
+            const isValid = String(testR.data).includes('Upload remessa') || String(testR.data).includes('enviarRemessa');
+            needsLogin = !isValid;
+        }
+        if (needsLogin) {
+            const result = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = result.phpsessid;
+            await db.collection('settings').doc(ownerId).update({ 'cra21.phpsessid': phpsessid });
+        }
+
+        // GET da home para descobrir o acao da "Plataforma de cancelamento"
+        const homeR = await axios.get(`${portalBase}/admin.php`, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 5
+        });
+        const homeHtml = String(homeR.data);
+
+        // Extrai todos os links do menu com seus textos para debug
+        const menuLinks = [...homeHtml.matchAll(/href="[^"]*admin\.php\?acao=([\w+/%=]+)"[^>]*>([\s\S]{0,80}?)<\/a>/gi)]
+            .map(m => ({ acao: m[1], texto: m[2].replace(/<[^>]+>/g,' ').trim() }));
+        console.log('[CRA21 Cancelar] Links do menu:', JSON.stringify(menuLinks.map(l=>l.texto)));
+
+        // Procura ação da plataforma de cancelamento
+        const cancelLink = menuLinks.find(l =>
+            /plataforma\s*de\s*cancelamento/i.test(l.texto) ||
+            /cancelar\s*envio/i.test(l.texto) ||
+            /desistên/i.test(l.texto) ||
+            /cancelamento/i.test(l.texto)
+        );
+
+        if (!cancelLink) {
+            return res.json({ ok: false, erro: 'Não encontrei a opção de cancelamento no portal CRA21. Logs: '+JSON.stringify(menuLinks.map(l=>l.texto).slice(0,15)) });
+        }
+        console.log('[CRA21 Cancelar] Acao cancelamento encontrada:', cancelLink.texto, '→', cancelLink.acao.slice(0,30)+'...');
+
+        const cancelUrl = `${portalBase}/admin.php?acao=${cancelLink.acao}`;
+        const strip = s => s.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+        const resultados = [];
+
+        for (const titulo of titulos) {
+            const cpf = (titulo.cpfCnpj || '').replace(/\D/g,'');
+            try {
+                // GET da página de cancelamento
+                const pageR = await axios.get(cancelUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, maxRedirects: 3
+                });
+                const pageHtml = String(pageR.data);
+                console.log('[CRA21 Cancelar] Página[0..600]:', pageHtml.slice(0,600));
+
+                const boundary = `----CraBoundary${Date.now()}`;
+                const mkField = (name, value) => Buffer.from(
+                    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
+
+                // Campos hidden (exceto os gerenciados)
+                const skipF = new Set(['NTISPOSTBACK','NTSUPERIORREF','acao','PHPSESSID','login','senha']);
+                const hiddenFields = [];
+                const hiddenRe = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi;
+                let hm;
+                while ((hm = hiddenRe.exec(pageHtml)) !== null)
+                    if (!skipF.has(hm[1])) hiddenFields.push({ n: hm[1], v: hm[2] });
+
+                // Nome do campo CPF/CNPJ na página
+                const cpfFieldM = pageHtml.match(/<input[^>]*name="([^"]*(?:cpf|cnpj|documento|devedor|numero)[^"]*)"[^>]*/i);
+                const cpfField = cpfFieldM ? cpfFieldM[1] : 'cpf_cnpj';
+                console.log('[CRA21 Cancelar] Campo CPF detectado:', cpfField);
+
+                // Selects (ex: tipo de cancelamento)
+                const selectRe = /<select[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/gi;
+                const selectFields = [];
+                let sm;
+                while ((sm = selectRe.exec(pageHtml)) !== null) {
+                    if (skipF.has(sm[1])) continue;
+                    const selOpt = sm[2].match(/<option[^>]*selected[^>]*value="([^"]*)"/i)
+                                || sm[2].match(/<option[^>]*value="([^"]+)"/i);
+                    selectFields.push({ n: sm[1], v: selOpt ? selOpt[1] : '' });
+                }
+
+                const parts = [
+                    mkField('NTISPOSTBACK', '1'),
+                    mkField('NTSUPERIORREF', cancelUrl),
+                    mkField('login', creds.usuario),
+                    mkField('senha', creds.senha),
+                    mkField(cpfField, cpf),
+                ];
+                for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
+                for (const s of selectFields) parts.push(mkField(s.n, s.v));
+
+                // Botão submit
+                const submitM = pageHtml.match(/<input[^>]*type="submit"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/i)
+                             || pageHtml.match(/<button[^>]*type="submit"[^>]*name="([^"]+)"[^>]*>([^<]+)<\/button>/i);
+                if (submitM) parts.push(mkField(submitM[1], submitM[2].trim()));
+                parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
+                const body = Buffer.concat(parts);
+
+                const postR = await axios.post(cancelUrl, body, {
+                    headers: {
+                        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                        'Content-Length': body.length,
+                        'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                        'User-Agent': userAgent,
+                        'Referer': cancelUrl
+                    },
+                    validateStatus: () => true,
+                    maxRedirects: 5
+                });
+
+                const respHtml = String(postR.data);
+                console.log('[CRA21 Cancelar] Resposta[0..1000]:', respHtml.slice(0,1000));
+
+                const succM = respHtml.match(/class="[^"]*(?:alert-success|sucesso|success|msg-sucesso)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|td)/i);
+                const errM  = respHtml.match(/class="[^"]*(?:alert-danger|erro|error|msg-erro|danger)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|td)/i);
+
+                if (errM)  resultados.push({ id: titulo.id, ok: false, erro: strip(errM[1]) });
+                else       resultados.push({ id: titulo.id, ok: true,  msg: succM ? strip(succM[1]) : 'Cancelamento processado' });
+
+            } catch(e) {
+                resultados.push({ id: titulo.id, ok: false, erro: e.message });
+            }
+        }
+
+        const nOk  = resultados.filter(r=>r.ok).length;
+        const nErr = resultados.filter(r=>!r.ok).length;
+        res.json({ ok: nErr===0, sucessos: nOk, erros: nErr, resultados,
+            msg: `${nOk} cancelamento(s) processado(s).${nErr?' '+nErr+' erro(s).':''}` });
+
+    } catch(e) {
+        console.error('[CRA21 Cancelar] Erro geral:', e.message);
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
 // ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor rodando na porta ' + PORT));
