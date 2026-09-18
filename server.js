@@ -1114,6 +1114,64 @@ async function cra21PortalLogin(usuario, senha, estado) {
     return { phpsessid, portalBase };
 }
 
+// ── Diagnóstico: retorna conteúdo dos JS chave do portal CRA21 ──
+// GET /cra21/debug-js?ownerId=xxx
+app.get('/cra21/debug-js', async (req, res) => {
+    const ownerId = req.query.ownerId;
+    if (!ownerId) return res.json({ ok: false, erro: 'ownerId obrigatório' });
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const baseUrl = `https://cra${uf}.crabr.com.br`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+
+        let phpsessid = creds.phpsessid || '';
+        if (!phpsessid) {
+            const r = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = r.phpsessid;
+        }
+
+        const jsUrls = [
+            `${baseUrl}/cra/site/js/common/cra.js?v=12.1.7`,
+            `${baseUrl}/cra/site/js/CraVisaoPaginaAdm.js?v=12.1.7`,
+            `${baseUrl}/cra/site/js/scripts.js?v=12.1.7`,
+        ];
+
+        const results = {};
+        for (const url of jsUrls) {
+            const r = await axios.get(url, {
+                headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                validateStatus: () => true, timeout: 15000
+            });
+            results[url.split('/').pop().split('?')[0]] = {
+                status: r.status,
+                size: String(r.data).length,
+                content: String(r.data)
+            };
+        }
+
+        // Também loga a página de upload completa para ver o HTML oculto
+        const UPLOAD_ACAO_DISPLAY = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9By2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_DISPLAY}`;
+        const pageR = await axios.get(uploadUrl, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 3
+        });
+        results['_uploadPageHtml'] = {
+            status: pageR.status,
+            size: String(pageR.data).length,
+            content: String(pageR.data)
+        };
+
+        return res.json({ ok: true, phpsessid: phpsessid.slice(0,8)+'...', results });
+    } catch (e) {
+        return res.json({ ok: false, erro: e.message });
+    }
+});
+
 app.post('/cra21/upload-portal', async (req, res) => {
     const { ownerId, arquivoBase64, nomeArquivo } = req.body;
     if (!ownerId || !arquivoBase64)
