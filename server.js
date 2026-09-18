@@ -1173,8 +1173,13 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const allInputs = uploadPageHtml.match(allInputsRe) || [];
         console.log(`[CRA21 Portal] Form inputs da página de upload: ${JSON.stringify(allInputs)}`);
 
-        // Campos que NÃO devemos duplicar (já adicionamos manualmente com valores corretos)
-        const skipFields = new Set(['NTISPOSTBACK', 'NTSUPERIORREF', 'acao', 'PHPSESSID', 'login', 'senha']);
+        // Campos que NÃO devemos incluir no POST de upload:
+        // - NTISPOSTBACK, NTSUPERIORREF, acao, PHPSESSID: gerenciados manualmente ou via URL
+        // - login, senha, code: quando a sessão PHP é válida, o JS do portal
+        //   (CraVisaoAcessoLogin.js) desabilita/remove esses campos antes do submit,
+        //   então eles NÃO são enviados. Mandá-los (mesmo vazios) faz o Sis21 tentar
+        //   autenticar e falhar com "Código inválido!" ou processar login em vez do upload.
+        const skipFields = new Set(['NTISPOSTBACK', 'NTSUPERIORREF', 'acao', 'PHPSESSID', 'login', 'senha', 'code']);
 
         // Extrai campos hidden da página (exceto os já gerenciados)
         const hiddenFields = [];
@@ -1216,6 +1221,28 @@ app.post('/cra21/upload-portal', async (req, res) => {
 
         console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
 
+        // Busca CraVisaoAcessoLogin.js para diagnóstico (entender o que o JS faz com login widget)
+        try {
+            const scriptUrlM = uploadPageHtml.match(/src="([^"]*CraVisaoAcessoLogin[^"]*\.js[^"]*)"/i)
+                            || uploadPageHtml.match(/src='([^']*CraVisaoAcessoLogin[^']*\.js[^']*)'/i);
+            if (scriptUrlM) {
+                const jsRelUrl = scriptUrlM[1];
+                const jsFullUrl = jsRelUrl.startsWith('http') ? jsRelUrl : `${portalBase}/${jsRelUrl.replace(/^\.?\//, '')}`;
+                const jsR = await axios.get(jsFullUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, maxRedirects: 2
+                });
+                const jsContent = String(jsR.data);
+                console.log(`[CRA21 Portal] CraVisaoAcessoLogin.js (${jsContent.length} chars):`);
+                console.log(`[CRA21 Portal] JS[0..3000]: ${jsContent.slice(0, 3000)}`);
+                if (jsContent.length > 3000) console.log(`[CRA21 Portal] JS[3000..6000]: ${jsContent.slice(3000, 6000)}`);
+            } else {
+                console.log(`[CRA21 Portal] CraVisaoAcessoLogin.js NÃO encontrado na página HTML`);
+            }
+        } catch (jsErr) {
+            console.log(`[CRA21 Portal] Erro ao buscar CraVisaoAcessoLogin.js: ${jsErr.message}`);
+        }
+
         // Monta multipart/form-data manualmente (sem dependência extra de npm)
         const fileBuffer = Buffer.from(arquivoBase64, 'base64');
         const nome = nomeArquivo || 'remessa.xlsx';
@@ -1224,18 +1251,13 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const mkField = (name, value) => Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
 
-        // Enviar login/senha como strings VAZIAS, exatamente como um browser real faz
-        // quando o usuário está logado via sessão PHP (o JS oculta o widget mas não remove os campos).
-        // - Com credenciais preenchidas → o Sis21 trata como tentativa de login (ignora o arquivo)
-        // - Com campos ausentes → validação server-side: "Informar os campos" (required)
-        // - Com strings vazias + sessão válida → servidor aceita e processa o upload
-        // NTSUPERIORREF deve ser vazio (igual ao que está no HTML do form)
+        // NÃO incluímos login/senha/code no POST.
+        // Quando a sessão PHP é válida, o CraVisaoAcessoLogin.js desabilita esses campos
+        // no browser antes do submit — campos disabled não são enviados pelo browser.
+        // Mandá-los (mesmo vazios) faz o Sis21 tratar a requisição como tentativa de login.
         const parts = [
             mkField('NTISPOSTBACK', '1'),
             mkField('NTSUPERIORREF', ''),
-            mkField('login', ''),
-            mkField('senha', ''),
-            mkField('code', ''),
         ];
         // Campos hidden da página (sem duplicar os já adicionados)
         for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
@@ -1305,6 +1327,7 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const erroPatterns = [
             /class="[^"]*(?:alert-danger|bg-danger|text-danger|mensagem-erro|msg-erro)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
             /<(?:div|p|span)[^>]*id="[^"]*(?:erro|error|msg)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span)>/i,
+            /C[oó]digo inv[aá]lido[^<]{0,200}/i,
             /Informar os campos[^<]{0,200}/i,
             /O nome do arquivo[^<]{0,200}/i,
             /Padr[aã]o Febraban[^<]{0,200}/i,
