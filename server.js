@@ -1261,14 +1261,16 @@ app.post('/cra21/upload-portal', async (req, res) => {
         });
 
         const uploadRespHtml = String(uploadR.data);
-        // Busca a mensagem de erro/validação especificamente
-        const erroBruto = uploadRespHtml.match(/(?:alert|mensagem|msg|erro|required|obrigat|campo)[^<]{0,300}/gi) || [];
-        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | erros encontrados: ${JSON.stringify(erroBruto.slice(0,5))}`);
-        console.log(`[CRA21 Portal] Upload resp html[0..1000]: ${uploadRespHtml.slice(0,1000)}`);
+        // Log completo para diagnóstico
+        const erroBruto = uploadRespHtml.match(/(?:alert|mensagem|msg|erro|required|obrigat|campo|padr|febraban|duplic|j[aá]\s+(?:foi|existe|envi))[^<]{0,300}/gi) || [];
+        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | URL final: ${uploadR.request?.res?.responseUrl || uploadR.config?.url}`);
+        console.log(`[CRA21 Portal] Textos relevantes no HTML: ${JSON.stringify(erroBruto.slice(0,8))}`);
+        console.log(`[CRA21 Portal] Upload resp html[0..2000]: ${uploadRespHtml.slice(0,2000)}`);
 
         const htmlR = uploadRespHtml;
+        const strip = s => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Sessão expirou durante upload? (verifica se a página de upload sumiu)
+        // Sessão expirou durante upload?
         const stillUploadPage = htmlR.includes('Upload remessa') || htmlR.includes('enviarRemessa');
         if (!stillUploadPage && (htmlR.includes('esqueceu a senha') || htmlR.includes('NTISPOSTBACK'))) {
             return res.json({ ok: false, erro: 'Sessão CRA21 expirou. Tente novamente.' });
@@ -1278,19 +1280,23 @@ app.post('/cra21/upload-portal', async (req, res) => {
         }
 
         // Detecta mensagens de erro/sucesso no HTML retornado (múltiplos padrões do Sis21)
-        const strip = s => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-
         // Padrões de ERRO
         const erroPatterns = [
             /class="[^"]*(?:alert-danger|bg-danger|text-danger|mensagem-erro|msg-erro|erro)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
             /<(?:div|p|span)[^>]*id="[^"]*(?:erro|error|msg)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span)>/i,
             /Informar os campos[^<]{0,200}/i,
+            /O nome do arquivo[^<]{0,200}/i,
+            /Padr[aã]o Febraban[^<]{0,200}/i,
+            /arquivo j[aá] foi[^<]{0,200}/i,
+            /j[aá] existe[^<]{0,200}/i,
+            /duplicad[oa][^<]{0,200}/i,
             /Erro[^<]{0,200}/i,
         ];
         // Padrões de SUCESSO
         const succPatterns = [
             /class="[^"]*(?:alert-success|bg-success|text-success|mensagem-sucesso|msg-sucesso|sucesso)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
-            /(?:Remessa|arquivo|upload)[^<]{0,200}(?:sucesso|processad|enviad|import)/i,
+            /(?:Remessa|arquivo|upload)[^<]{0,200}(?:sucesso|processad|enviad|import|aceito)/i,
+            /(?:recebid|salvo|gravado|registrado)[^<]{0,200}/i,
         ];
 
         let erroMsg = '', succMsg = '';
@@ -1303,11 +1309,22 @@ app.post('/cra21/upload-portal', async (req, res) => {
             if (m) { succMsg = strip(m[1] || m[0]); break; }
         }
 
+        console.log(`[CRA21 Portal] erroMsg="${erroMsg}" | succMsg="${succMsg}" | stillUploadPage=${stillUploadPage}`);
+
         if (erroMsg && !succMsg) {
             return res.json({ ok: false, erro: erroMsg });
         }
 
-        const msg = succMsg || (erroMsg ? '' : 'Remessa enviada ao portal CRA21 com sucesso.');
+        // Se a página ainda mostra o formulário de upload E não há mensagem de sucesso,
+        // provavelmente houve um erro não detectado
+        if (stillUploadPage && !succMsg && !erroMsg) {
+            // Extrai texto visível da página para diagnóstico
+            const textoVisivel = strip(htmlR).slice(0, 500);
+            console.log(`[CRA21 Portal] ATENÇÃO: formulário de upload ainda visível sem msg clara. Texto: ${textoVisivel}`);
+            return res.json({ ok: false, erro: `Portal retornou a página de upload sem mensagem clara. Possível erro não detectado. Texto da página: "${textoVisivel.slice(0,200)}"` });
+        }
+
+        const msg = succMsg || 'Remessa enviada ao portal CRA21 com sucesso.';
         return res.json({ ok: true, mensagem: msg });
 
     } catch (e) {
