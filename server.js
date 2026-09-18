@@ -1502,10 +1502,21 @@ app.post('/cra21/upload-portal', async (req, res) => {
         };
 
         // ═══════════════════════════════════════════════════════════════
-        // Monta o corpo multipart (file-only, como jQuery File Upload faz)
+        // Monta corpos multipart para as estratégias
         // ═══════════════════════════════════════════════════════════════
+        // Body "file-only" — para URL AJAX que recebe apenas o arquivo
         const bndMain = `----CraBoundary${Date.now()}`;
         const bodyMain = buildMultipart(bndMain, [], fileField, nome, fileBuffer);
+
+        // Body "form-completo" — inclui NTISPOSTBACK=1 + campos obrigatórios do form
+        // O Sis21 usa NTISPOSTBACK=1 para distinguir "processar formulário" de "exibir página"
+        // Sem ele, o PHP renderiza a página com widget de login e retorna "Informar os campos (*)"
+        const bndFull = `----CraBoundary${Date.now()}F`;
+        const bodyFull = buildMultipart(bndFull, [
+            ['NTISPOSTBACK', '1'],
+            ['tipoRemessa', tipoRemessaVal],
+            [submitName, submitValue]   // ex: enviar=Enviar (simula clique no botão submit)
+        ], fileField, nome, fileBuffer);
 
         // ═══════════════════════════════════════════════════════════════
         // ESTRATÉGIA A: URL descoberta no JS da página (mais provável de funcionar)
@@ -1550,17 +1561,23 @@ app.post('/cra21/upload-portal', async (req, res) => {
             }
         }
 
+        // ── Helper: verifica se a resposta indica sucesso ──
+        const isRespOk = (r) => {
+            const h = String(r.data);
+            return r.status >= 200 && r.status < 300 && r.status !== 500
+                && !/informar os campos|campos marcados/i.test(h);
+        };
+
         // ═══════════════════════════════════════════════════════════════
-        // ESTRATÉGIA B: tipoFuncao=2 + X-Requested-With (AJAX) — fallback
+        // ESTRATÉGIA B: NTISPOSTBACK=1 + campos obrigatórios + arquivo
+        // Sis21 usa NTISPOSTBACK=1 para processar o form em vez de exibir a página
         // ═══════════════════════════════════════════════════════════════
         if (!uploadR) {
-            const bndB = `----CraBoundary${Date.now()}B`;
-            const bodyB = buildMultipart(bndB, [], fileField, nome, fileBuffer);
-            console.log(`[CRA21 Portal] Tentativa B: POST tipoFuncao=2 + X-Requested-With | URL: ${uploadUrl}`);
-            uploadR = await axios.post(uploadUrl, bodyB, {
+            console.log(`[CRA21 Portal] Tentativa B: POST NTISPOSTBACK=1 + campos form | URL: ${uploadUrl}`);
+            const rB = await axios.post(uploadUrl, bodyFull, {
                 headers: {
-                    'Content-Type': `multipart/form-data; boundary=${bndB}`,
-                    'Content-Length': bodyB.length,
+                    'Content-Type': `multipart/form-data; boundary=${bndFull}`,
+                    'Content-Length': bodyFull.length,
                     'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
                     'User-Agent': userAgent,
                     'Referer': uploadUrl,
@@ -1569,10 +1586,39 @@ app.post('/cra21/upload-portal', async (req, res) => {
                 validateStatus: () => true,
                 maxRedirects: 5
             });
-            const respBHtml = String(uploadR.data);
-            const ctB = (uploadR.headers['content-type'] || '').toLowerCase();
-            console.log(`[CRA21 Portal] Tentativa B status=${uploadR.status} ct=${ctB} size=${respBHtml.length}`);
-            console.log(`[CRA21 Portal] Tentativa B body[0..800]: ${respBHtml.slice(0, 800)}`);
+            const hB = String(rB.data);
+            const ctB = (rB.headers['content-type'] || '').toLowerCase();
+            console.log(`[CRA21 Portal] Tentativa B status=${rB.status} ct=${ctB} size=${hB.length}`);
+            console.log(`[CRA21 Portal] Tentativa B body[0..800]: ${hB.slice(0, 800)}`);
+            if (isRespOk(rB)) uploadR = rB;
+            else console.log(`[CRA21 Portal] Tentativa B falhou — caindo para Tentativa C`);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ESTRATÉGIA C: file-only sem NTISPOSTBACK (jQuery File Upload puro)
+        // jQuery File Upload em modo AJAX envia apenas o arquivo, sem outros campos
+        // ═══════════════════════════════════════════════════════════════
+        if (!uploadR) {
+            const bndC = `----CraBoundary${Date.now()}C`;
+            const bodyC = buildMultipart(bndC, [], fileField, nome, fileBuffer);
+            console.log(`[CRA21 Portal] Tentativa C: POST file-only sem NTISPOSTBACK | URL: ${uploadUrl}`);
+            const rC = await axios.post(uploadUrl, bodyC, {
+                headers: {
+                    'Content-Type': `multipart/form-data; boundary=${bndC}`,
+                    'Content-Length': bodyC.length,
+                    'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                    'User-Agent': userAgent,
+                    'Referer': uploadUrl,
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                validateStatus: () => true,
+                maxRedirects: 5
+            });
+            const hC = String(rC.data);
+            const ctC = (rC.headers['content-type'] || '').toLowerCase();
+            console.log(`[CRA21 Portal] Tentativa C status=${rC.status} ct=${ctC} size=${hC.length}`);
+            console.log(`[CRA21 Portal] Tentativa C body[0..800]: ${hC.slice(0, 800)}`);
+            uploadR = rC; // usa C independentemente — é o fallback final
         }
 
         const uploadRespRaw = uploadR.data;
