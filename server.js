@@ -1316,6 +1316,162 @@ app.post('/cra21/upload-portal', async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────
+// CRA21: Cancelar protesto de títulos individualmente
+// ─────────────────────────────────────────────────────────────
+app.post('/cra21/cancelar-protesto', async (req, res) => {
+    const { ownerId, titulos } = req.body;
+    // titulos: [{ id, cpfCnpj, nomeDevedor, nossoNumero }]
+    if (!ownerId || !titulos?.length)
+        return res.json({ ok: false, erro: 'ownerId e titulos obrigatórios' });
+
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+        // Sessão válida?
+        let phpsessid = creds.phpsessid || '';
+        let needsLogin = !phpsessid;
+        const UPLOAD_ACAO = creds.uploadAcao || 'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        if (phpsessid) {
+            const testR = await axios.get(`${portalBase}/admin.php?acao=${UPLOAD_ACAO}`, {
+                headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                validateStatus: () => true, maxRedirects: 3
+            });
+            const isValid = String(testR.data).includes('Upload remessa') || String(testR.data).includes('enviarRemessa');
+            needsLogin = !isValid;
+        }
+        if (needsLogin) {
+            const result = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = result.phpsessid;
+            await db.collection('settings').doc(ownerId).update({ 'cra21.phpsessid': phpsessid });
+        }
+
+        // GET da home para descobrir o acao da "Plataforma de cancelamento"
+        const homeR = await axios.get(`${portalBase}/admin.php`, {
+            headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+            validateStatus: () => true, maxRedirects: 5
+        });
+        const homeHtml = String(homeR.data);
+
+        // Extrai todos os links do menu com seus textos para debug
+        const menuLinks = [...homeHtml.matchAll(/href="[^"]*admin\.php\?acao=([\w+/%=]+)"[^>]*>([\s\S]{0,80}?)<\/a>/gi)]
+            .map(m => ({ acao: m[1], texto: m[2].replace(/<[^>]+>/g,' ').trim() }));
+        console.log('[CRA21 Cancelar] Links do menu:', JSON.stringify(menuLinks.map(l=>l.texto)));
+
+        // Procura ação da plataforma de cancelamento
+        const cancelLink = menuLinks.find(l =>
+            /plataforma\s*de\s*cancelamento/i.test(l.texto) ||
+            /cancelar\s*envio/i.test(l.texto) ||
+            /desistên/i.test(l.texto) ||
+            /cancelamento/i.test(l.texto)
+        );
+
+        if (!cancelLink) {
+            return res.json({ ok: false, erro: 'Não encontrei a opção de cancelamento no portal CRA21. Logs: '+JSON.stringify(menuLinks.map(l=>l.texto).slice(0,15)) });
+        }
+        console.log('[CRA21 Cancelar] Acao cancelamento encontrada:', cancelLink.texto, '→', cancelLink.acao.slice(0,30)+'...');
+
+        const cancelUrl = `${portalBase}/admin.php?acao=${cancelLink.acao}`;
+        const strip = s => s.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+        const resultados = [];
+
+        for (const titulo of titulos) {
+            const cpf = (titulo.cpfCnpj || '').replace(/\D/g,'');
+            try {
+                // GET da página de cancelamento
+                const pageR = await axios.get(cancelUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, maxRedirects: 3
+                });
+                const pageHtml = String(pageR.data);
+                console.log('[CRA21 Cancelar] Página[0..600]:', pageHtml.slice(0,600));
+
+                const boundary = `----CraBoundary${Date.now()}`;
+                const mkField = (name, value) => Buffer.from(
+                    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
+
+                // Campos hidden (exceto os gerenciados)
+                const skipF = new Set(['NTISPOSTBACK','NTSUPERIORREF','acao','PHPSESSID','login','senha']);
+                const hiddenFields = [];
+                const hiddenRe = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi;
+                let hm;
+                while ((hm = hiddenRe.exec(pageHtml)) !== null)
+                    if (!skipF.has(hm[1])) hiddenFields.push({ n: hm[1], v: hm[2] });
+
+                // Nome do campo CPF/CNPJ na página
+                const cpfFieldM = pageHtml.match(/<input[^>]*name="([^"]*(?:cpf|cnpj|documento|devedor|numero)[^"]*)"[^>]*/i);
+                const cpfField = cpfFieldM ? cpfFieldM[1] : 'cpf_cnpj';
+                console.log('[CRA21 Cancelar] Campo CPF detectado:', cpfField);
+
+                // Selects (ex: tipo de cancelamento)
+                const selectRe = /<select[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/gi;
+                const selectFields = [];
+                let sm;
+                while ((sm = selectRe.exec(pageHtml)) !== null) {
+                    if (skipF.has(sm[1])) continue;
+                    const selOpt = sm[2].match(/<option[^>]*selected[^>]*value="([^"]*)"/i)
+                                || sm[2].match(/<option[^>]*value="([^"]+)"/i);
+                    selectFields.push({ n: sm[1], v: selOpt ? selOpt[1] : '' });
+                }
+
+                const parts = [
+                    mkField('NTISPOSTBACK', '1'),
+                    mkField('NTSUPERIORREF', cancelUrl),
+                    mkField('login', creds.usuario),
+                    mkField('senha', creds.senha),
+                    mkField(cpfField, cpf),
+                ];
+                for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
+                for (const s of selectFields) parts.push(mkField(s.n, s.v));
+
+                // Botão submit
+                const submitM = pageHtml.match(/<input[^>]*type="submit"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/i)
+                             || pageHtml.match(/<button[^>]*type="submit"[^>]*name="([^"]+)"[^>]*>([^<]+)<\/button>/i);
+                if (submitM) parts.push(mkField(submitM[1], submitM[2].trim()));
+                parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
+                const body = Buffer.concat(parts);
+
+                const postR = await axios.post(cancelUrl, body, {
+                    headers: {
+                        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                        'Content-Length': body.length,
+                        'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                        'User-Agent': userAgent,
+                        'Referer': cancelUrl
+                    },
+                    validateStatus: () => true,
+                    maxRedirects: 5
+                });
+
+                const respHtml = String(postR.data);
+                console.log('[CRA21 Cancelar] Resposta[0..1000]:', respHtml.slice(0,1000));
+
+                const succM = respHtml.match(/class="[^"]*(?:alert-success|sucesso|success|msg-sucesso)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|td)/i);
+                const errM  = respHtml.match(/class="[^"]*(?:alert-danger|erro|error|msg-erro|danger)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|td)/i);
+
+                if (errM)  resultados.push({ id: titulo.id, ok: false, erro: strip(errM[1]) });
+                else       resultados.push({ id: titulo.id, ok: true,  msg: succM ? strip(succM[1]) : 'Cancelamento processado' });
+
+            } catch(e) {
+                resultados.push({ id: titulo.id, ok: false, erro: e.message });
+            }
+        }
+
+        const nOk  = resultados.filter(r=>r.ok).length;
+        const nErr = resultados.filter(r=>!r.ok).length;
+        res.json({ ok: nErr===0, sucessos: nOk, erros: nErr, resultados,
+            msg: `${nOk} cancelamento(s) processado(s).${nErr?' '+nErr+' erro(s).':''}` });
+
+    } catch(e) {
+        console.error('[CRA21 Cancelar] Erro geral:', e.message);
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
 // ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor rodando na porta ' + PORT));
