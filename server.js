@@ -1174,7 +1174,7 @@ app.post('/cra21/upload-portal', async (req, res) => {
         console.log(`[CRA21 Portal] Form inputs da página de upload: ${JSON.stringify(allInputs)}`);
 
         // Campos que NÃO devemos duplicar (já adicionamos manualmente com valores corretos)
-        const skipFields = new Set(['NTISPOSTBACK', 'NTSUPERIORREF', 'acao', 'PHPSESSID']);
+        const skipFields = new Set(['NTISPOSTBACK', 'NTSUPERIORREF', 'acao', 'PHPSESSID', 'login', 'senha']);
 
         // Extrai campos hidden da página (exceto os já gerenciados)
         const hiddenFields = [];
@@ -1227,6 +1227,8 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const parts = [
             mkField('NTISPOSTBACK', '1'),
             mkField('NTSUPERIORREF', uploadUrl),
+            mkField('login', creds.usuario),
+            mkField('senha', creds.senha),
         ];
         // Campos hidden da página (sem duplicar os já adicionados)
         for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
