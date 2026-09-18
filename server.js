@@ -1224,12 +1224,18 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const mkField = (name, value) => Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
 
-        // IMPORTANTE: NÃO incluir login/senha no POST de upload.
-        // O portal Sis21 processa login quando recebe essas credenciais no corpo do POST,
-        // mesmo com sessão válida — o arquivo é descartado. A sessão PHP já autentica.
+        // Enviar login/senha como strings VAZIAS, exatamente como um browser real faz
+        // quando o usuário está logado via sessão PHP (o JS oculta o widget mas não remove os campos).
+        // - Com credenciais preenchidas → o Sis21 trata como tentativa de login (ignora o arquivo)
+        // - Com campos ausentes → validação server-side: "Informar os campos" (required)
+        // - Com strings vazias + sessão válida → servidor aceita e processa o upload
+        // NTSUPERIORREF deve ser vazio (igual ao que está no HTML do form)
         const parts = [
             mkField('NTISPOSTBACK', '1'),
-            mkField('NTSUPERIORREF', uploadUrl),
+            mkField('NTSUPERIORREF', ''),
+            mkField('login', ''),
+            mkField('senha', ''),
+            mkField('code', ''),
         ];
         // Campos hidden da página (sem duplicar os já adicionados)
         for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
