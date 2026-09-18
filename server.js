@@ -1126,15 +1126,24 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
         const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-        // acao da página de upload de remessa (PHP serializado em base64 — estático por portal)
-        const UPLOAD_ACAO = creds.uploadAcao ||
+        // acao do Sis21 é PHP serializado em base64.
+        // tipoFuncao=2 → EXIBIÇÃO da página (GET — retorna o HTML com o form)
+        // tipoFuncao=1 → PROCESSAMENTO da ação (POST — onde o form envia os dados)
+        // Nosso erro histórico: sempre postávamos para tipoFuncao=2 (display),
+        // que valida o login widget. O POST correto vai para tipoFuncao=1 (action).
+        const UPLOAD_ACAO_DISPLAY = creds.uploadAcao ||
             'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+        // tipoFuncao=1: mesma ação, função de processamento (i:2 → i:1 no PHP serializado)
+        const UPLOAD_ACAO_ACTION = creds.uploadAcaoAction ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6MTt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
 
         // Tenta sessão armazenada; se expirada, faz login
         let phpsessid = creds.phpsessid || '';
         let needsLogin = !phpsessid;
 
-        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`;
+        // GET da página usa tipoFuncao=2 (display); POST do upload usa tipoFuncao=1 (action)
+        const uploadUrl     = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_DISPLAY}`;
+        const uploadPostUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO_ACTION}`;
 
         // Testa sessão: verifica se a página de upload está acessível (título correto)
         if (phpsessid) {
@@ -1282,12 +1291,13 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const mkField = (name, value) => Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
 
-        // ── POST mínimo estilo AJAX (jQuery File Upload) ──
-        // O upload real no browser é feito via AJAX pelo jQuery File Upload plugin —
-        // NÃO é um form submit tradicional. O plugin envia APENAS o arquivo (sem
-        // login/senha/NTISPOSTBACK). O PHP usa a sessão do cookie + acao da URL.
-        // Portanto, não incluímos NENHUM campo de form — só o arquivo.
+        // ── POST para tipoFuncao=1 (action endpoint) ──
+        // O endpoint de ação do Sis21 pode precisar de NTISPOSTBACK=1 para saber
+        // que é um submit de form (não um GET de exibição). Enviamos apenas esse
+        // campo + o arquivo. NÃO enviamos login/senha/code — a sessão PHP é suficiente.
         const parts = [];
+        // NTISPOSTBACK=1: indica para o Sis21 que é um submit de formulário
+        parts.push(mkField('NTISPOSTBACK', '1'));
         // Arquivo
         parts.push(Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${nome}"\r\n` +
@@ -1301,7 +1311,8 @@ app.post('/cra21/upload-portal', async (req, res) => {
 
         console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | PHPSESSID: ${phpsessid.slice(0,8)}...`);
 
-        const uploadR = await axios.post(uploadUrl, body, {
+        console.log(`[CRA21 Portal] POST URL (tipoFuncao=1/action): ${uploadPostUrl}`);
+        const uploadR = await axios.post(uploadPostUrl, body, {
             headers: {
                 'Content-Type': `multipart/form-data; boundary=${boundary}`,
                 'Content-Length': body.length,
