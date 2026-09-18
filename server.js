@@ -1134,34 +1134,39 @@ app.post('/cra21/upload-portal', async (req, res) => {
         let phpsessid = creds.phpsessid || '';
         let needsLogin = !phpsessid;
 
+        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`;
+
+        // Testa sessão: verifica se a página de upload está acessível (título correto)
         if (phpsessid) {
-            const testR = await axios.get(`${portalBase}/admin.php?acao=${UPLOAD_ACAO}`, {
+            const testR = await axios.get(uploadUrl, {
                 headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
-                validateStatus: () => true, maxRedirects: 0
+                validateStatus: () => true, maxRedirects: 3
             });
             const testHtml = String(testR.data);
-            needsLogin = testR.status >= 300 ||
-                         testHtml.toLowerCase().includes('type="password"') ||
-                         testHtml.includes('esqueceu a senha') ||
-                         testHtml.includes('Acesso negado');
+            // Sessão é VÁLIDA se a página de upload for retornada (título contém "Upload remessa")
+            // INVÁLIDA se o título for só "CRA" ou vier redirect
+            const isUploadPage = testHtml.includes('Upload remessa') || testHtml.includes('enviarRemessa');
+            needsLogin = !isUploadPage;
+            console.log(`[CRA21 Portal] Teste sessão: ${isUploadPage ? 'válida' : 'expirada'}`);
         }
 
         if (needsLogin) {
             console.log(`[CRA21 Portal] Sessão inválida — fazendo login automático...`);
             const result = await cra21PortalLogin(creds.usuario, creds.senha, estado);
             phpsessid = result.phpsessid;
-            // Salva sessão no Firestore para reutilização
             await db.collection('settings').doc(ownerId).update({ 'cra21.phpsessid': phpsessid });
         }
 
-        const uploadUrl = `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`;
-
-        // GET da página de upload para capturar campos hidden e valor do botão submit
+        // GET da página de upload para capturar campos e analisar formulário
         const uploadPageR = await axios.get(uploadUrl, {
             headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
             validateStatus: () => true, maxRedirects: 3
         });
         const uploadPageHtml = String(uploadPageR.data);
+
+        // Loga o bloco do formulário para diagnóstico
+        const formMatch = uploadPageHtml.match(/<form[\s\S]{0,10000}?<\/form>/i);
+        console.log(`[CRA21 Portal] Form HTML: ${formMatch ? formMatch[0].slice(0,2000) : '(form não encontrado)'}`);
 
         // Loga todos os inputs/selects do form para diagnóstico
         const allInputsRe = /<(?:input|select|textarea)[^>]*>/gi;
@@ -1253,12 +1258,17 @@ app.post('/cra21/upload-portal', async (req, res) => {
             maxRedirects: 5
         });
 
-        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | resp: ${String(uploadR.data).slice(0,600)}`);
+        const uploadRespHtml = String(uploadR.data);
+        // Busca a mensagem de erro/validação especificamente
+        const erroBruto = uploadRespHtml.match(/(?:alert|mensagem|msg|erro|required|obrigat|campo)[^<]{0,300}/gi) || [];
+        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | erros encontrados: ${JSON.stringify(erroBruto.slice(0,5))}`);
+        console.log(`[CRA21 Portal] Upload resp html[0..1000]: ${uploadRespHtml.slice(0,1000)}`);
 
-        const htmlR = String(uploadR.data);
+        const htmlR = uploadRespHtml;
 
-        // Sessão expirou durante upload?
-        if (htmlR.toLowerCase().includes('type="password"') || htmlR.includes('esqueceu a senha')) {
+        // Sessão expirou durante upload? (verifica se a página de upload sumiu)
+        const stillUploadPage = htmlR.includes('Upload remessa') || htmlR.includes('enviarRemessa');
+        if (!stillUploadPage && (htmlR.includes('esqueceu a senha') || htmlR.includes('NTISPOSTBACK'))) {
             return res.json({ ok: false, erro: 'Sessão CRA21 expirou. Tente novamente.' });
         }
         if (uploadR.status >= 400) {
