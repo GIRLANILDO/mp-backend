@@ -1270,19 +1270,23 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const htmlR = uploadRespHtml;
         const strip = s => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Sessão expirou durante upload?
-        const stillUploadPage = htmlR.includes('Upload remessa') || htmlR.includes('enviarRemessa');
-        if (!stillUploadPage && (htmlR.includes('esqueceu a senha') || htmlR.includes('NTISPOSTBACK'))) {
-            return res.json({ ok: false, erro: 'Sessão CRA21 expirou. Tente novamente.' });
-        }
         if (uploadR.status >= 400) {
             return res.json({ ok: false, erro: `Portal CRA21 retornou status ${uploadR.status}` });
         }
 
-        // Detecta mensagens de erro/sucesso no HTML retornado (múltiplos padrões do Sis21)
-        // Padrões de ERRO
+        // Verifica se a sessão expirou (voltou para a página de login)
+        const isLoginPage = htmlR.includes('esqueceu a senha') ||
+                           (htmlR.includes('NTISPOSTBACK') && !htmlR.includes('Upload remessa'));
+        if (isLoginPage) {
+            return res.json({ ok: false, erro: 'Sessão CRA21 expirou durante o upload. Tente novamente.' });
+        }
+
+        // Verifica se ainda está na página de upload (formulário presente = não foi redirecionado)
+        const stillUploadPage = htmlR.includes('Upload remessa') || htmlR.includes('enviarRemessa');
+
+        // Padrões de ERRO (só verificamos erros na própria página de upload)
         const erroPatterns = [
-            /class="[^"]*(?:alert-danger|bg-danger|text-danger|mensagem-erro|msg-erro|erro)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
+            /class="[^"]*(?:alert-danger|bg-danger|text-danger|mensagem-erro|msg-erro)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
             /<(?:div|p|span)[^>]*id="[^"]*(?:erro|error|msg)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span)>/i,
             /Informar os campos[^<]{0,200}/i,
             /O nome do arquivo[^<]{0,200}/i,
@@ -1290,42 +1294,32 @@ app.post('/cra21/upload-portal', async (req, res) => {
             /arquivo j[aá] foi[^<]{0,200}/i,
             /j[aá] existe[^<]{0,200}/i,
             /duplicad[oa][^<]{0,200}/i,
-            /Erro[^<]{0,200}/i,
-        ];
-        // Padrões de SUCESSO
-        const succPatterns = [
-            /class="[^"]*(?:alert-success|bg-success|text-success|mensagem-sucesso|msg-sucesso|sucesso)[^"]*"[^>]*>([\s\S]{1,400}?)<\/(?:div|p|span|td)>/i,
-            /(?:Remessa|arquivo|upload)[^<]{0,200}(?:sucesso|processad|enviad|import|aceito)/i,
-            /(?:recebid|salvo|gravado|registrado)[^<]{0,200}/i,
         ];
 
-        let erroMsg = '', succMsg = '';
+        let erroMsg = '';
         for (const p of erroPatterns) {
             const m = htmlR.match(p);
             if (m) { erroMsg = strip(m[1] || m[0]); break; }
         }
-        for (const p of succPatterns) {
-            const m = htmlR.match(p);
-            if (m) { succMsg = strip(m[1] || m[0]); break; }
-        }
 
-        console.log(`[CRA21 Portal] erroMsg="${erroMsg}" | succMsg="${succMsg}" | stillUploadPage=${stillUploadPage}`);
+        console.log(`[CRA21 Portal] erroMsg="${erroMsg}" | stillUploadPage=${stillUploadPage} | isLoginPage=${isLoginPage}`);
 
-        if (erroMsg && !succMsg) {
+        // Se encontrou mensagem de erro clara → falhou
+        if (erroMsg) {
             return res.json({ ok: false, erro: erroMsg });
         }
 
-        // Se a página ainda mostra o formulário de upload E não há mensagem de sucesso,
-        // provavelmente houve um erro não detectado
-        if (stillUploadPage && !succMsg && !erroMsg) {
-            // Extrai texto visível da página para diagnóstico
+        // Se ainda está na página de upload E não há mensagem de erro detectável → erro não detectado
+        if (stillUploadPage) {
             const textoVisivel = strip(htmlR).slice(0, 500);
-            console.log(`[CRA21 Portal] ATENÇÃO: formulário de upload ainda visível sem msg clara. Texto: ${textoVisivel}`);
-            return res.json({ ok: false, erro: `Portal retornou a página de upload sem mensagem clara. Possível erro não detectado. Texto da página: "${textoVisivel.slice(0,200)}"` });
+            console.log(`[CRA21 Portal] ATENÇÃO: formulário de upload ainda visível sem msg de erro clara. Texto: ${textoVisivel}`);
+            return res.json({ ok: false, erro: `O portal não aceitou o arquivo. Verifique manualmente no CRA21. Texto retornado: "${textoVisivel.slice(0,200)}"` });
         }
 
-        const msg = succMsg || 'Remessa enviada ao portal CRA21 com sucesso.';
-        return res.json({ ok: true, mensagem: msg });
+        // Se NÃO está mais na página de upload e não tem erro → SUCESSO
+        // (O portal redirecionou para outra página, o que acontece após upload bem-sucedido)
+        console.log(`[CRA21 Portal] Upload bem-sucedido — portal redirecionou para outra página (comportamento esperado)`);
+        return res.json({ ok: true, mensagem: 'Remessa enviada ao portal CRA21 com sucesso.' });
 
     } catch (e) {
         console.error('[CRA21 Portal] Erro:', e.message);
