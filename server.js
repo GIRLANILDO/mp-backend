@@ -1162,22 +1162,41 @@ app.post('/cra21/upload-portal', async (req, res) => {
             validateStatus: () => true, maxRedirects: 3
         });
         const uploadPageHtml = String(uploadPageR.data);
-        console.log(`[CRA21 Portal] Upload page html[0..600]: ${uploadPageHtml.slice(0,600)}`);
 
-        // Extrai campos hidden da página (exceto acao e PHPSESSID)
+        // Loga todos os inputs/selects do form para diagnóstico
+        const allInputsRe = /<(?:input|select|textarea)[^>]*>/gi;
+        const allInputs = uploadPageHtml.match(allInputsRe) || [];
+        console.log(`[CRA21 Portal] Form inputs da página de upload: ${JSON.stringify(allInputs)}`);
+
+        // Campos que NÃO devemos duplicar (já adicionamos manualmente com valores corretos)
+        const skipFields = new Set(['NTISPOSTBACK', 'NTSUPERIORREF', 'acao', 'PHPSESSID']);
+
+        // Extrai campos hidden da página (exceto os já gerenciados)
         const hiddenFields = [];
         const hiddenRe = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
         let hm;
         while ((hm = hiddenRe.exec(uploadPageHtml)) !== null) {
             const n = hm[1], v = hm[2];
-            if (n !== 'acao' && n !== 'PHPSESSID') hiddenFields.push({ n, v });
+            if (!skipFields.has(n)) hiddenFields.push({ n, v });
         }
-        // Também tenta name antes de value
         const hiddenRe2 = /<input[^>]*type="hidden"[^>]*value="([^"]*)"[^>]*name="([^"]+)"[^>]*>/gi;
         const found = new Set(hiddenFields.map(h => h.n));
         while ((hm = hiddenRe2.exec(uploadPageHtml)) !== null) {
             const n = hm[2], v = hm[1];
-            if (n !== 'acao' && n !== 'PHPSESSID' && !found.has(n)) hiddenFields.push({ n, v });
+            if (!skipFields.has(n) && !found.has(n)) hiddenFields.push({ n, v });
+        }
+
+        // Extrai selects com valor selecionado (campos obrigatórios tipo "tipo de remessa")
+        const selectRe = /<select[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/gi;
+        const selectFields = [];
+        let sm;
+        while ((sm = selectRe.exec(uploadPageHtml)) !== null) {
+            const selName = sm[1];
+            if (skipFields.has(selName)) continue;
+            // Pega option com selected, ou o primeiro option com valor
+            const selOpt = sm[2].match(/<option[^>]*selected[^>]*value="([^"]*)"/i)
+                        || sm[2].match(/<option[^>]*value="([^"]+)"/i);
+            selectFields.push({ n: selName, v: selOpt ? selOpt[1] : '' });
         }
 
         // Nome do campo file e valor do botão submit
@@ -1190,7 +1209,7 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const submitName  = submitM ? submitM[1] : 'enviar';
         const submitValue = submitM ? submitM[2].trim() : 'Enviar';
 
-        console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
+        console.log(`[CRA21 Portal] hidden: ${JSON.stringify(hiddenFields)} | selects: ${JSON.stringify(selectFields)} | fileField="${fileField}" | submit: ${submitName}="${submitValue}"`);
 
         // Monta multipart/form-data manualmente (sem dependência extra de npm)
         const fileBuffer = Buffer.from(arquivoBase64, 'base64');
@@ -1204,8 +1223,10 @@ app.post('/cra21/upload-portal', async (req, res) => {
             mkField('NTISPOSTBACK', '1'),
             mkField('NTSUPERIORREF', uploadUrl),
         ];
-        // Campos hidden da página
+        // Campos hidden da página (sem duplicar os já adicionados)
         for (const h of hiddenFields) parts.push(mkField(h.n, h.v));
+        // Campos select (com valor selecionado ou primeiro valor)
+        for (const s of selectFields) parts.push(mkField(s.n, s.v));
         // Arquivo
         parts.push(Buffer.from(
             `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${nome}"\r\n` +
