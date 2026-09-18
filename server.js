@@ -1524,7 +1524,7 @@ app.post('/cra21/upload-portal', async (req, res) => {
         // O <form action="..."> pode conter tipoFuncao=1 para processar.
         // Usar a URL errada faz Sis21 chamar apresentar() em vez de processar().
         // ═══════════════════════════════════════════════════════════
-        let formPostUrl = uploadUrl;  // fallback
+        let formPostUrl = uploadPostUrl;  // usa tipoFuncao=1 (action/process) como default
 
         // Tenta encontrar o <form> que contém o campo enviarRemessa e pegar seu action
         const formHtmlM = uploadPageHtml.match(/<form(?:[^>]*)>([\s\S]{0,6000}?)<\/form>/gi) || [];
