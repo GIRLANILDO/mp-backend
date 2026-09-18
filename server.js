@@ -965,5 +965,189 @@ app.post('/cra21/cancelar', async (req, res) => {
     }
 });
 // ============================================================
+// ROTA 17 — Upload de remessa direto ao portal web CRA21
+// ============================================================
+
+// Helper: login automático no portal CRA21 e retorna PHPSESSID
+async function cra21PortalLogin(usuario, senha, estado) {
+    const uf = (estado || 'AM').toLowerCase();
+    const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    // Passo 1: GET página de login para obter PHPSESSID inicial e acao do formulário
+    const pageR = await axios.get(`${portalBase}/`, {
+        headers: { 'User-Agent': userAgent, 'Cookie': 'aceito-cookie=yes' },
+        validateStatus: () => true, maxRedirects: 5
+    });
+
+    let phpsessid = '';
+    for (const c of (pageR.headers['set-cookie'] || [])) {
+        const m = c.match(/PHPSESSID=([^;]+)/i);
+        if (m) { phpsessid = m[1]; break; }
+    }
+
+    const html = String(pageR.data);
+
+    // Extrai acao do formulário de login (no atributo action ou em input hidden)
+    const m1 = html.match(/action="[^"]*[?&]acao=([A-Za-z0-9+/=]+)/i);
+    const m2 = html.match(/<input[^>]*name="acao"[^>]*value="([A-Za-z0-9+/=]+)"/i)
+            || html.match(/<input[^>]*value="([A-Za-z0-9+/=]+)"[^>]*name="acao"/i);
+    const loginAcao = (m1 || m2)?.[1] || '';
+
+    if (!loginAcao) {
+        // Verifica se já está autenticado
+        if (html.includes('menuApresentante') || html.includes('Upload remessa') || html.includes('CraMenu')) {
+            console.log('[CRA21 Portal] Já autenticado');
+            return { phpsessid, portalBase };
+        }
+        throw new Error('Não encontrei o formulário de login do portal CRA21. Verifique as credenciais.');
+    }
+
+    // Detecta nomes dos campos usuário/senha no formulário
+    const userField = (html.match(/<input[^>]*type="text"[^>]*name="([^"]+)"/i) || [])[1] || 'usuario';
+    const passField = (html.match(/<input[^>]*type="password"[^>]*name="([^"]+)"/i) || [])[1] || 'senha';
+
+    // Passo 2: POST com credenciais
+    const form = new URLSearchParams();
+    form.append('NTISPOSTBACK', '1');
+    form.append('NTSUPERIORREF', `${portalBase}/`);
+    form.append(userField, usuario);
+    form.append(passField, senha);
+
+    const loginR = await axios.post(
+        `${portalBase}/admin.php?acao=${loginAcao}`,
+        form.toString(),
+        {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                'User-Agent': userAgent,
+                'Referer': `${portalBase}/`
+            },
+            validateStatus: () => true, maxRedirects: 5
+        }
+    );
+
+    for (const c of (loginR.headers['set-cookie'] || [])) {
+        const m = c.match(/PHPSESSID=([^;]+)/i);
+        if (m) { phpsessid = m[1]; break; }
+    }
+
+    const loginHtml = String(loginR.data);
+    if (loginHtml.toLowerCase().includes('type="password"') && !loginHtml.includes('menuApresentante')) {
+        throw new Error('Usuário ou senha incorretos no portal CRA21.');
+    }
+
+    console.log(`[CRA21 Portal] Login OK | sessão: ${phpsessid.slice(0,8)}...`);
+    return { phpsessid, portalBase };
+}
+
+app.post('/cra21/upload-portal', async (req, res) => {
+    const { ownerId, arquivoBase64, nomeArquivo } = req.body;
+    if (!ownerId || !arquivoBase64)
+        return res.json({ ok: false, erro: 'ownerId e arquivoBase64 obrigatórios' });
+
+    try {
+        const creds = await getCra21Creds(ownerId);
+        const estado = creds.estado || 'AM';
+        const uf = estado.toLowerCase();
+        const portalBase = `https://cra${uf}.crabr.com.br/cra${uf}/site`;
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+        // acao da página de upload de remessa (PHP serializado em base64 — estático por portal)
+        const UPLOAD_ACAO = creds.uploadAcao ||
+            'NDQ5NTI5MEJPOjEwOiJTaXMyMV9BY2FvIjo5OntzOjE1OiIAKgBwcm9wcmllZGFkZXMiO086MTA6IkxpYjIxQXJyYXkiOjE6e3M6MTc6IgBMaWIyMUFycmF5AGFycmF5IjthOjM6e3M6MTQ6ImNsYXNzZUNvbnRyb2xlIjtzOjI4OiJDcmFBcHJlc2VudGFudGVVcGxvYWRSZW1lc3NhIjtzOjk6ImNsYXNzZVBhaSI7czoyNjoiQ3JhTWVudUFwcmVzZW50YW50ZVJlbWVzc2EiO3M6MTA6InRpcG9GdW5jYW8iO2k6Mjt9fXM6OToiACoAY29kaWdvIjtOO3M6MTA6IgAqAGFjYW9QYWkiO047czoxMToiACoAbWVuc2FnZW0iO047czoxNToiACoAbWVuc2FnZW1FcnJvIjtOO3M6MTU6IgAqAG1lbnNhZ2VtSW5mbyI7TjtzOjk6IgAqAHRpdHVsbyI7czoxNDoiVXBsb2FkIHJlbWVzc2EiO3M6MjQ6IgAqAGNhbWluaG9SZWxhdGl2b0ltYWdlbSI7TjtzOjE1OiIAKgBhY2Vzc29OZWdhZG8iO2I6MDt9';
+
+        // Tenta sessão armazenada; se expirada, faz login
+        let phpsessid = creds.phpsessid || '';
+        let needsLogin = !phpsessid;
+
+        if (phpsessid) {
+            const testR = await axios.get(`${portalBase}/admin.php?acao=${UPLOAD_ACAO}`, {
+                headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                validateStatus: () => true, maxRedirects: 0
+            });
+            const testHtml = String(testR.data);
+            needsLogin = testR.status >= 300 ||
+                         testHtml.toLowerCase().includes('type="password"') ||
+                         testHtml.includes('esqueceu a senha') ||
+                         testHtml.includes('Acesso negado');
+        }
+
+        if (needsLogin) {
+            console.log(`[CRA21 Portal] Sessão inválida — fazendo login automático...`);
+            const result = await cra21PortalLogin(creds.usuario, creds.senha, estado);
+            phpsessid = result.phpsessid;
+            // Salva sessão no Firestore para reutilização
+            await db.collection('settings').doc(ownerId).update({ 'cra21.phpsessid': phpsessid });
+        }
+
+        // Monta multipart/form-data manualmente (sem dependência extra de npm)
+        const fileBuffer = Buffer.from(arquivoBase64, 'base64');
+        const nome = nomeArquivo || 'remessa.xlsx';
+        const boundary = `----CraBoundary${Date.now()}`;
+
+        const field = (name, value) => Buffer.from(
+            `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf-8');
+
+        const body = Buffer.concat([
+            field('NTISPOSTBACK', '1'),
+            field('NTSUPERIORREF', `${portalBase}/admin.php?`),
+            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="enviarRemessa"; filename="${nome}"\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`, 'utf-8'),
+            fileBuffer,
+            Buffer.from('\r\n', 'utf-8'),
+            field('enviar', ''),
+            Buffer.from(`--${boundary}--\r\n`, 'utf-8')
+        ]);
+
+        console.log(`[CRA21 Portal] Enviando remessa "${nome}" | ${fileBuffer.length} bytes | PHPSESSID: ${phpsessid.slice(0,8)}...`);
+
+        const uploadR = await axios.post(
+            `${portalBase}/admin.php?acao=${UPLOAD_ACAO}`,
+            body,
+            {
+                headers: {
+                    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                    'Content-Length': body.length,
+                    'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                    'User-Agent': userAgent,
+                    'Referer': `${portalBase}/admin.php?`
+                },
+                validateStatus: () => true,
+                maxRedirects: 5
+            }
+        );
+
+        console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | resp: ${String(uploadR.data).slice(0,400)}`);
+
+        const htmlR = String(uploadR.data);
+
+        // Sessão expirou durante upload?
+        if (htmlR.toLowerCase().includes('type="password"') || htmlR.includes('esqueceu a senha')) {
+            return res.json({ ok: false, erro: 'Sessão CRA21 expirou. Tente novamente.' });
+        }
+        if (uploadR.status >= 400) {
+            return res.json({ ok: false, erro: `Portal CRA21 retornou status ${uploadR.status}` });
+        }
+
+        // Detecta mensagem de sucesso/erro no HTML retornado
+        const erroM = htmlR.match(/class="[^"]*(?:alert-danger|bg-danger|text-danger)[^"]*"[^>]*>([\s\S]{1,300}?)<\/(?:div|p|span)>/i);
+        const succM = htmlR.match(/class="[^"]*(?:alert-success|bg-success|text-success)[^"]*"[^>]*>([\s\S]{1,300}?)<\/(?:div|p|span)>/i);
+
+        if (erroM) {
+            const msg = erroM[1].replace(/<[^>]+>/g, '').trim();
+            return res.json({ ok: false, erro: msg || 'Erro no portal CRA21.' });
+        }
+
+        const msg = succM ? succM[1].replace(/<[^>]+>/g, '').trim() : 'Remessa enviada ao portal CRA21 com sucesso.';
+        return res.json({ ok: true, mensagem: msg });
+
+    } catch (e) {
+        console.error('[CRA21 Portal] Erro:', e.message);
+        res.json({ ok: false, erro: e.message });
+    }
+});
+
+// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor rodando na porta ' + PORT));
