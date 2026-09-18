@@ -1282,14 +1282,56 @@ app.post('/cra21/upload-portal', async (req, res) => {
         });
         const uploadPageHtml = String(uploadPageR.data);
 
-        // Loga o bloco do formulário para diagnóstico
-        const formMatch = uploadPageHtml.match(/<form[\s\S]{0,10000}?<\/form>/i);
-        console.log(`[CRA21 Portal] Form HTML: ${formMatch ? formMatch[0].slice(0,2000) : '(form não encontrado)'}`);
+        // ── Extrai e loga script src's (compacto, não trunca nos logs do Railway) ──
+        const allScriptSrcList = [];
+        { const re = /src=["']([^"']+\.js[^"']*)["']/gi; let m2;
+          while ((m2 = re.exec(uploadPageHtml)) !== null) allScriptSrcList.push(m2[1]); }
+        console.log(`[CRA21 Portal] Scripts incluídos: ${JSON.stringify(allScriptSrcList)}`);
 
-        // Loga todos os inputs/selects do form para diagnóstico
-        const allInputsRe = /<(?:input|select|textarea)[^>]*>/gi;
-        const allInputs = uploadPageHtml.match(allInputsRe) || [];
-        console.log(`[CRA21 Portal] Form inputs da página de upload: ${JSON.stringify(allInputs)}`);
+        // ── Busca URL do upload no JS específico da página ──
+        // O jQuery File Upload é configurado num JS como CraApresentanteUploadRemessa.js
+        // com algo como: $('#fileupload').fileupload({ url: '...', ... })
+        const pageSpecificSrcs = allScriptSrcList.filter(s =>
+            /CraApresentante|Remessa|Upload|cra\.js|CraVisaoPagina/i.test(s) &&
+            !/sislib21|Lib21|jquery|ie-fix|maskedinput|AcessoLogin|Assinatura|Relogio/i.test(s)
+        );
+        console.log(`[CRA21 Portal] JS específico da página: ${JSON.stringify(pageSpecificSrcs)}`);
+
+        let discoveredUploadUrl = null;
+        const baseUrlJs = `https://cra${uf}.crabr.com.br`;
+        for (const relSrc of pageSpecificSrcs.slice(0, 6)) {
+            let fullJsUrl;
+            if (relSrc.startsWith('http')) fullJsUrl = relSrc;
+            else if (relSrc.startsWith('/')) fullJsUrl = `${baseUrlJs}${relSrc}`;
+            else {
+                // relative from /craam/site/ — resolve ../../ prefix
+                const clean = relSrc.replace(/^(\.\.\/)+/, '/');
+                fullJsUrl = `${baseUrlJs}${clean}`;
+            }
+            try {
+                const jsR2 = await axios.get(fullJsUrl, {
+                    headers: { 'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`, 'User-Agent': userAgent },
+                    validateStatus: () => true, timeout: 15000
+                });
+                const jsC2 = String(jsR2.data);
+                console.log(`[CRA21 Portal] JS ${relSrc.split('/').pop().split('?')[0]} size=${jsC2.length}`);
+                // Procura configuração do jQuery File Upload: url: '...'
+                const urlMatch2 =
+                    jsC2.match(/fileupload\s*\(\s*\{[\s\S]{0,300}?url\s*:\s*["']([^"']+)["']/i) ||
+                    jsC2.match(/url\s*:\s*["']([^"']*admin\.php[^"']*)["']/i) ||
+                    jsC2.match(/(?:url|action)\s*:\s*["']([^"']*acao=[^"']+)["']/i) ||
+                    jsC2.match(/\$\.ajax\s*\(\s*\{[\s\S]{0,300}?url\s*:\s*["']([^"']+)["']/i);
+                if (urlMatch2) {
+                    discoveredUploadUrl = urlMatch2[1];
+                    console.log(`[CRA21 Portal] ✓ URL de upload encontrada em ${relSrc.split('/').pop().split('?')[0]}: ${discoveredUploadUrl}`);
+                    break;
+                }
+                // Se não achou pela regex, loga os primeiros 500 chars para inspeção manual
+                console.log(`[CRA21 Portal] JS snippet: ${jsC2.slice(0, 500)}`);
+            } catch (eJs) {
+                console.log(`[CRA21 Portal] Erro ao buscar JS ${relSrc}: ${eJs.message}`);
+            }
+        }
 
         // Campos que NÃO devemos incluir no POST de upload:
         // - NTISPOSTBACK, NTSUPERIORREF, acao, PHPSESSID: gerenciados manualmente ou via URL
@@ -1368,71 +1410,33 @@ app.post('/cra21/upload-portal', async (req, res) => {
         };
 
         // ═══════════════════════════════════════════════════════════════
-        // ESTRATÉGIA 1: tipoFuncao=1 (action) + NTISPOSTBACK=1 + tipoRemessa
-        // ─ Nunca tentado antes com NTISPOSTBACK=1. O PHP action handler
-        //   processa o upload sem tocar no widget de login.
+        // Monta o corpo multipart (file-only, como jQuery File Upload faz)
         // ═══════════════════════════════════════════════════════════════
-        const bnd1 = `----CraBoundary${Date.now()}A`;
-        const extraFields1 = [
-            ['NTISPOSTBACK', '1'],
-            ['tipoRemessa', tipoRemessaVal],
-        ];
-        // Adiciona campos hidden extraídos da página (exceto login/senha)
-        for (const { n, v } of hiddenFields) extraFields1.push([n, v]);
-        const body1 = buildMultipart(bnd1, extraFields1, fileField, nome, fileBuffer);
-
-        console.log(`[CRA21 Portal] Tentativa 1: POST tipoFuncao=1 (action) + NTISPOSTBACK=1 | URL: ${uploadPostUrl}`);
-        const uploadR1 = await axios.post(uploadPostUrl, body1, {
-            headers: {
-                'Content-Type': `multipart/form-data; boundary=${bnd1}`,
-                'Content-Length': body1.length,
-                'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
-                'User-Agent': userAgent,
-                'Referer': uploadUrl,
-                'X-Requested-With': 'XMLHttpRequest',
-            },
-            validateStatus: () => true,
-            maxRedirects: 5
-        });
-
-        const resp1Html = String(uploadR1.data);
-        const ct1 = (uploadR1.headers['content-type'] || '').toLowerCase();
-        console.log(`[CRA21 Portal] Tentativa 1 status=${uploadR1.status} ct=${ct1} size=${resp1Html.length}`);
-        console.log(`[CRA21 Portal] Tentativa 1 body[0..1000]: ${resp1Html.slice(0, 1000)}`);
-
-        // Detecta sucesso na tentativa 1
-        const isValidationErr1 = /informar os campos|campos marcados/i.test(resp1Html);
-        const isSuccess1 = (uploadR1.status >= 200 && uploadR1.status < 300 && !isValidationErr1 && uploadR1.status !== 500)
-            && (
-                ct1.includes('json')
-                || resp1Html.trimStart().startsWith('{')
-                || resp1Html.trimStart().startsWith('[')
-                || resp1Html.includes('sucesso')
-                || resp1Html.includes('enviado')
-                || resp1Html.includes('CraHome')
-            );
-
-        if (isSuccess1) {
-            console.log(`[CRA21 Portal] Tentativa 1 SUCESSO!`);
-        } else {
-            console.log(`[CRA21 Portal] Tentativa 1 falhou (validationErr=${isValidationErr1} status=${uploadR1.status}) — tentando Estratégia 2`);
-        }
+        const bndMain = `----CraBoundary${Date.now()}`;
+        const bodyMain = buildMultipart(bndMain, [], fileField, nome, fileBuffer);
 
         // ═══════════════════════════════════════════════════════════════
-        // ESTRATÉGIA 2: tipoFuncao=2 (display) + X-Requested-With AJAX
-        //   (abordagem atual que retorna "Informar os campos")
+        // ESTRATÉGIA A: URL descoberta no JS da página (mais provável de funcionar)
+        //   O jQuery File Upload é configurado com uma URL específica no JS.
+        //   tipoFuncao=1 → 500 (confirmado), tipoFuncao=2 → validação login (confirmado).
+        //   A URL real pode ser diferente das duas acima.
         // ═══════════════════════════════════════════════════════════════
-        let uploadR = uploadR1;
-        if (!isSuccess1) {
-            const bnd2 = `----CraBoundary${Date.now()}B`;
-            // Só o arquivo — sem NTISPOSTBACK, sem login, sem tipoRemessa (jQuery FU puro)
-            const body2 = buildMultipart(bnd2, [], fileField, nome, fileBuffer);
+        // Resolve URL descoberta (pode ser relativa)
+        let effectiveUploadUrl = discoveredUploadUrl
+            ? (discoveredUploadUrl.startsWith('http')
+                ? discoveredUploadUrl
+                : discoveredUploadUrl.startsWith('/')
+                    ? `${baseUrlJs}${discoveredUploadUrl}`
+                    : `${portalBase}/${discoveredUploadUrl.replace(/^\.\.\//, '').replace(/^\//, '')}`)
+            : null;
 
-            console.log(`[CRA21 Portal] Tentativa 2: POST tipoFuncao=2 + X-Requested-With (AJAX) | URL: ${uploadUrl}`);
-            uploadR = await axios.post(uploadUrl, body2, {
+        let uploadR;
+        if (effectiveUploadUrl) {
+            console.log(`[CRA21 Portal] Tentativa A (URL do JS): POST ${effectiveUploadUrl}`);
+            uploadR = await axios.post(effectiveUploadUrl, bodyMain, {
                 headers: {
-                    'Content-Type': `multipart/form-data; boundary=${bnd2}`,
-                    'Content-Length': body2.length,
+                    'Content-Type': `multipart/form-data; boundary=${bndMain}`,
+                    'Content-Length': bodyMain.length,
                     'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
                     'User-Agent': userAgent,
                     'Referer': uploadUrl,
@@ -1441,10 +1445,42 @@ app.post('/cra21/upload-portal', async (req, res) => {
                 validateStatus: () => true,
                 maxRedirects: 5
             });
-            const resp2Html = String(uploadR.data);
-            const ct2 = (uploadR.headers['content-type'] || '').toLowerCase();
-            console.log(`[CRA21 Portal] Tentativa 2 status=${uploadR.status} ct=${ct2} size=${resp2Html.length}`);
-            console.log(`[CRA21 Portal] Tentativa 2 body[0..1000]: ${resp2Html.slice(0, 1000)}`);
+            const respAHtml = String(uploadR.data);
+            const ctA = (uploadR.headers['content-type'] || '').toLowerCase();
+            console.log(`[CRA21 Portal] Tentativa A status=${uploadR.status} ct=${ctA} size=${respAHtml.length}`);
+            console.log(`[CRA21 Portal] Tentativa A body[0..800]: ${respAHtml.slice(0, 800)}`);
+            const isOkA = uploadR.status >= 200 && uploadR.status < 300
+                && !/informar os campos|campos marcados/i.test(respAHtml)
+                && uploadR.status !== 500;
+            if (!isOkA) {
+                console.log(`[CRA21 Portal] Tentativa A falhou — caindo para Tentativa B`);
+                uploadR = null;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ESTRATÉGIA B: tipoFuncao=2 + X-Requested-With (AJAX) — fallback
+        // ═══════════════════════════════════════════════════════════════
+        if (!uploadR) {
+            const bndB = `----CraBoundary${Date.now()}B`;
+            const bodyB = buildMultipart(bndB, [], fileField, nome, fileBuffer);
+            console.log(`[CRA21 Portal] Tentativa B: POST tipoFuncao=2 + X-Requested-With | URL: ${uploadUrl}`);
+            uploadR = await axios.post(uploadUrl, bodyB, {
+                headers: {
+                    'Content-Type': `multipart/form-data; boundary=${bndB}`,
+                    'Content-Length': bodyB.length,
+                    'Cookie': `aceito-cookie=yes; PHPSESSID=${phpsessid}`,
+                    'User-Agent': userAgent,
+                    'Referer': uploadUrl,
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                validateStatus: () => true,
+                maxRedirects: 5
+            });
+            const respBHtml = String(uploadR.data);
+            const ctB = (uploadR.headers['content-type'] || '').toLowerCase();
+            console.log(`[CRA21 Portal] Tentativa B status=${uploadR.status} ct=${ctB} size=${respBHtml.length}`);
+            console.log(`[CRA21 Portal] Tentativa B body[0..800]: ${respBHtml.slice(0, 800)}`);
         }
 
         const uploadRespRaw = uploadR.data;
