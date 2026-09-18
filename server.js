@@ -900,29 +900,40 @@ app.post('/cra21/enviar-remessa', async (req, res) => {
         return res.json({ ok: false, erro: 'ownerId e titulos[] obrigatórios' });
     try {
         const creds = await getCra21Creds(ownerId);
+        const codApres   = creds.codApres   || '';
+        const idCartorio = creds.idCartorio || '';
+        const params = new URLSearchParams();
+        if (idCartorio) params.set('idCartorio', idCartorio);
+        if (codApres)   params.set('idApresentante', codApres);
+        const qs = params.toString();
         const payload = titulos.map(t => ({
-            NOME_DEVEDOR:     t.nomeDevedor,
-            CPF_CNPJ_DEVEDOR: t.cpfCnpj,
-            LOGRADOURO:       t.logradouro,
-            NUMERO:           t.numero,
-            COMPLEMENTO:      '',
-            BAIRRO:           t.bairro,
-            CEP:              t.cep,
-            MUNICIPIO:        t.municipio,
-            UF:               t.uf,
-            NUMERO_TITULO:    t.numeroTitulo,
-            ESPECIE:          t.especie,
-            DATA_EMISSAO:     t.dataEmissao,
-            DATA_VENCIMENTO:  t.dataVencimento,
-            VALOR:            t.valor,
-            SALDO:            t.valor,
-            NOSSO_NUMERO:     t.numeroTitulo,
-            COMARCA:          t.comarca
+            NOME_DEVEDOR:      t.nomeDevedor,
+            CPF_CNPJ_DEVEDOR:  t.cpfCnpj,
+            LOGRADOURO:        t.logradouro,
+            NUMERO:            t.numero,
+            COMPLEMENTO:       '',
+            BAIRRO:            t.bairro,
+            CEP:               t.cep,
+            MUNICIPIO:         t.municipio,
+            UF:                t.uf,
+            NUMERO_TITULO:     t.numeroTitulo,
+            ESPECIE:           t.especie,
+            DATA_EMISSAO:      t.dataEmissao,
+            DATA_VENCIMENTO:   t.dataVencimento,
+            VALOR:             t.valor,
+            SALDO:             t.valor,
+            NOSSO_NUMERO:      t.numeroTitulo,
+            COMARCA:           t.comarca,
+            ID_APRESENTANTE:   codApres,
+            ID_CARTORIO:       idCartorio
         }));
-        const r = await axios.post(`${creds.baseUrl}/remessa`, payload, {
+        const urlRemessa = `${creds.baseUrl}/titulo${qs ? '?' + qs : ''}`;
+        console.log(`[CRA21] Enviando remessa: POST ${urlRemessa} | ${titulos.length} título(s)`);
+        const r = await axios.post(urlRemessa, payload, {
             headers: { Authorization: basicAuth(creds.usuario, creds.senha), 'Content-Type': 'application/json' },
             validateStatus: () => true
         });
+        console.log(`[CRA21] Remessa status: ${r.status} | resp:`, JSON.stringify(r.data).slice(0,300));
         if (r.status >= 400) return res.json({ ok: false, erro: `CRA21 retornou ${r.status}`, data: r.data });
         console.log(`[CRA21] Remessa enviada: ${titulos.length} título(s) para ${ownerId}`);
         res.json({ ok: true, data: r.data });
