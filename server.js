@@ -1265,7 +1265,12 @@ app.post('/cra21/upload-portal', async (req, res) => {
         const erroBruto = uploadRespHtml.match(/(?:alert|mensagem|msg|erro|required|obrigat|campo|padr|febraban|duplic|j[aá]\s+(?:foi|existe|envi))[^<]{0,300}/gi) || [];
         console.log(`[CRA21 Portal] Upload status: ${uploadR.status} | URL final: ${uploadR.request?.res?.responseUrl || uploadR.config?.url}`);
         console.log(`[CRA21 Portal] Textos relevantes no HTML: ${JSON.stringify(erroBruto.slice(0,8))}`);
-        console.log(`[CRA21 Portal] Upload resp html[0..2000]: ${uploadRespHtml.slice(0,2000)}`);
+        // Log em partes para ver o HTML completo nos logs
+        const htmlParts = uploadRespHtml.length;
+        console.log(`[CRA21 Portal] HTML total: ${htmlParts} chars`);
+        console.log(`[CRA21 Portal] HTML[0..3000]: ${uploadRespHtml.slice(0,3000)}`);
+        if (htmlParts > 3000) console.log(`[CRA21 Portal] HTML[3000..6000]: ${uploadRespHtml.slice(3000,6000)}`);
+        if (htmlParts > 6000) console.log(`[CRA21 Portal] HTML[6000..9000]: ${uploadRespHtml.slice(6000,9000)}`);
 
         const htmlR = uploadRespHtml;
         const strip = s => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1311,9 +1316,20 @@ app.post('/cra21/upload-portal', async (req, res) => {
 
         // Se ainda está na página de upload E não há mensagem de erro detectável → erro não detectado
         if (stillUploadPage) {
-            const textoVisivel = strip(htmlR).slice(0, 500);
-            console.log(`[CRA21 Portal] ATENÇÃO: formulário de upload ainda visível sem msg de erro clara. Texto: ${textoVisivel}`);
-            return res.json({ ok: false, erro: `O portal não aceitou o arquivo. Verifique manualmente no CRA21. Texto retornado: "${textoVisivel.slice(0,200)}"` });
+            // Tenta extrair qualquer mensagem de aviso/alerta da página — procura padrões mais genéricos
+            const textoCompleto = strip(htmlR);
+            // Procura por padrões de mensagem que o portal pode usar
+            const msgGenerica = (
+                htmlR.match(/class="[^"]*(?:alert|aviso|warning|notice|mensagem|message)[^"]*"[^>]*>([\s\S]{1,500}?)<\/(?:div|p|span|td)>/i)?.[1] ||
+                htmlR.match(/<(?:strong|b)[^>]*>\s*(?:Erro|Atenção|Aviso|Alerta)[^<]*<\/(?:strong|b)>[^<]{0,300}/i)?.[0] ||
+                ''
+            );
+            const msgLimpa = msgGenerica ? strip(msgGenerica) : '';
+            // Pega um trecho do meio da página (onde ficam as mensagens, depois do header)
+            const meio = textoCompleto.slice(200, 800);
+            console.log(`[CRA21 Portal] ATENÇÃO: formulário ainda visível. Msg genérica: "${msgLimpa}" | Meio da página: "${meio}"`);
+            const erroFinal = msgLimpa || meio.slice(0, 300) || textoCompleto.slice(0, 300);
+            return res.json({ ok: false, erro: `Portal rejeitou o arquivo. Mensagem: "${erroFinal.slice(0,400)}"` });
         }
 
         // Se NÃO está mais na página de upload e não tem erro → SUCESSO
