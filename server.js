@@ -10,6 +10,8 @@ app.use(express.json());
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');   // ← FCM
+const { getAuth } = require('firebase-admin/auth');
+const crypto = require('crypto');
 const serviceAccount = {
     type: "service_account",
     project_id: "sisvenda-775d9",
@@ -88,6 +90,124 @@ const PRECOS = {
     agenda:  { 30: 80,  60: 150, 90: 220 },
     vendas:  { 30: 120, 60: 220, 90: 320 }
 };
+// ============================================================
+// SENHAS DAS ÓTICAS — painel master do sistema de vendas
+// O Firebase não deixa ninguém ver a senha de uma conta. Por isso, sempre que a senha
+// é definida pelo painel master ou trocada pela própria ótica (pelas rotas abaixo),
+// o servidor troca a senha no Firebase e guarda uma cópia CRIPTOGRAFADA em
+// master_senhas/{uid}. Só a conta master consegue pedir a senha decifrada.
+// ============================================================
+const MASTER_EMAILS = ['girlanildo@gmail.com'];
+const CHAVE_SENHAS = crypto.createHash('sha256')
+    .update('senhas-oticas|' + (process.env.SENHAS_CHAVE || process.env.FIREBASE_PRIVATE_KEY || ''))
+    .digest();
+function cifrarSenha(texto) {
+    const iv = crypto.randomBytes(12);
+    const c = crypto.createCipheriv('aes-256-gcm', CHAVE_SENHAS, iv);
+    const enc = Buffer.concat([c.update(String(texto), 'utf8'), c.final()]);
+    return [iv, c.getAuthTag(), enc].map(b => b.toString('base64')).join('.');
+}
+function decifrarSenha(guardada) {
+    try {
+        const [iv, tag, enc] = String(guardada).split('.').map(x => Buffer.from(x, 'base64'));
+        const d = crypto.createDecipheriv('aes-256-gcm', CHAVE_SENHAS, iv);
+        d.setAuthTag(tag);
+        return Buffer.concat([d.update(enc), d.final()]).toString('utf8');
+    } catch (e) { return null; }
+}
+async function usuarioDaRequisicao(req) {
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (!token) { const e = new Error('Faça login novamente.'); e.status = 401; throw e; }
+    try { return await getAuth().verifyIdToken(token); }
+    catch (err) { const e = new Error('Sessão expirada. Faça login novamente.'); e.status = 401; throw e; }
+}
+async function exigirMaster(req) {
+    const u = await usuarioDaRequisicao(req);
+    if (!MASTER_EMAILS.includes(String(u.email || '').toLowerCase())) {
+        const e = new Error('Acesso negado.'); e.status = 403; throw e;
+    }
+    return u;
+}
+async function guardarSenha(uid, senha) {
+    await db.collection('master_senhas').doc(uid).set({
+        senha: cifrarSenha(senha),
+        atualizadaEm: new Date().toISOString()
+    });
+}
+function validarSenha(senha) {
+    if (typeof senha !== 'string' || senha.length < 6) {
+        const e = new Error('A senha precisa ter no mínimo 6 caracteres.'); e.status = 400; throw e;
+    }
+}
+const responderErro = (res, err) => res.status(err.status || 500).json({ error: err.message });
+
+// Lista e-mail e senha das contas (só master). Body: { uids: [...] }
+app.post('/master/contas', async (req, res) => {
+    try {
+        await exigirMaster(req);
+        const uids = Array.isArray(req.body?.uids) ? req.body.uids.filter(Boolean).map(String) : [];
+        const resultado = {};
+        for (let i = 0; i < uids.length; i += 100) {
+            const lote = uids.slice(i, i + 100);
+            const [usuarios, senhas] = await Promise.all([
+                getAuth().getUsers(lote.map(uid => ({ uid }))),
+                db.getAll(...lote.map(uid => db.collection('master_senhas').doc(uid)))
+            ]);
+            const senhaPorUid = {};
+            senhas.forEach(d => { if (d.exists) senhaPorUid[d.id] = d.data(); });
+            usuarios.users.forEach(u => {
+                const g = senhaPorUid[u.uid];
+                const senha = g ? decifrarSenha(g.senha) : null;
+                // Se a senha foi trocada por fora (ex.: "esqueci minha senha"), o Firebase
+                // marca a data em tokensValidAfterTime — aí a cópia guardada ficou velha.
+                const trocadaEm = u.tokensValidAfterTime ? new Date(u.tokensValidAfterTime).getTime() : 0;
+                const guardadaEm = g?.atualizadaEm ? new Date(g.atualizadaEm).getTime() : 0;
+                let situacao = 'nao_registrada';
+                if (senha) situacao = (trocadaEm && trocadaEm > guardadaEm + 120000) ? 'desatualizada' : 'ok';
+                resultado[u.uid] = {
+                    email: u.email || '',
+                    senha: situacao === 'nao_registrada' ? null : senha,
+                    situacao,
+                    ultimoAcesso: u.metadata?.lastSignInTime || null,
+                    desativada: !!u.disabled
+                };
+            });
+        }
+        res.json({ contas: resultado });
+    } catch (err) { responderErro(res, err); }
+});
+
+// Master define uma nova senha para a conta de uma ótica. Body: { uid, senha }
+app.post('/master/definir-senha', async (req, res) => {
+    try {
+        await exigirMaster(req);
+        const { uid, senha } = req.body || {};
+        if (!uid) return res.status(400).json({ error: 'uid obrigatório' });
+        validarSenha(senha);
+        await getAuth().updateUser(String(uid), { password: senha });
+        await guardarSenha(String(uid), senha);
+        console.log(`🔑 Master definiu nova senha para ${uid}`);
+        res.json({ ok: true });
+    } catch (err) {
+        if (err.code === 'auth/user-not-found') return res.status(404).json({ error: 'Conta não encontrada no Firebase.' });
+        responderErro(res, err);
+    }
+});
+
+// A própria ótica troca a senha dela (logada). Body: { novaSenha }
+app.post('/conta/alterar-senha', async (req, res) => {
+    try {
+        const u = await usuarioDaRequisicao(req);
+        const { novaSenha } = req.body || {};
+        validarSenha(novaSenha);
+        await getAuth().updateUser(u.uid, { password: novaSenha });
+        await guardarSenha(u.uid, novaSenha);
+        console.log(`🔑 Conta ${u.uid} trocou a própria senha`);
+        res.json({ ok: true });
+    } catch (err) { responderErro(res, err); }
+});
+
 // ============================================================
 // LICENÇA DO SISTEMA DE VENDAS — libera a ótica e registra no painel master
 // Chamado quando um Pix de licença (metadata.sistema = 'vendas') é aprovado.
