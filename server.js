@@ -8,7 +8,7 @@ app.use(express.json());
 // FIREBASE ADMIN SDK
 // ============================================================
 const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');   // ← FCM
 const serviceAccount = {
     type: "service_account",
@@ -89,6 +89,75 @@ const PRECOS = {
     vendas:  { 30: 120, 60: 220, 90: 320 }
 };
 // ============================================================
+// LICENÇA DO SISTEMA DE VENDAS — libera a ótica e registra no painel master
+// Chamado quando um Pix de licença (metadata.sistema = 'vendas') é aprovado.
+// • estende settings/{shop_id}.validade (soma os dias ao que a ótica ainda tinha)
+// • grava o pagamento em master_pagamentos (aparece no Financeiro do painel master)
+// É seguro chamar várias vezes: o mesmo pagamento só é contado uma vez.
+// ============================================================
+async function confirmarLicencaVendas(pagamento) {
+    const meta    = pagamento.metadata || {};
+    const shopId  = meta.shop_id || meta.shopId;
+    if (pagamento.status !== 'approved' || meta.sistema !== 'vendas' || !shopId) return null;
+
+    const dias  = parseInt(meta.dias) || 30;
+    const valor = Number(pagamento.transaction_amount) || 0;
+    const pagoEm = pagamento.date_approved ? new Date(pagamento.date_approved) : new Date();
+    const dataISO = (d) => d.toLocaleDateString('en-CA', { timeZone: 'America/Manaus' }); // AAAA-MM-DD
+
+    const settingsRef = db.collection('settings').doc(String(shopId));
+    const pagRef      = db.collection('master_pagamentos').doc('mp_' + pagamento.id);
+
+    // nome do plano que o master definiu para esta ótica (só para exibir no Financeiro)
+    let planoId = '', planoNome = '';
+    try {
+        const [assSnap, planosSnap] = await Promise.all([
+            db.collection('master_assinantes').doc(String(shopId)).get(),
+            db.collection('master_config').doc('planos').get()
+        ]);
+        planoId = (assSnap.exists && assSnap.data().planoId) || '';
+        const lista = (planosSnap.exists && planosSnap.data().planos) || [];
+        planoNome = (lista.find(p => p.id === planoId) || {}).nome || '';
+    } catch (e) { /* sem plano definido — segue */ }
+
+    return db.runTransaction(async (t) => {
+        const [pagSnap, setSnap] = await Promise.all([t.get(pagRef), t.get(settingsRef)]);
+        if (pagSnap.exists) return { validade: pagSnap.data().validadeISO || null, jaRegistrado: true };
+
+        const sd = setSnap.exists ? setSnap.data() : {};
+        let atual = null;
+        if (sd.validade) atual = sd.validade.toDate ? sd.validade.toDate() : new Date(sd.validade);
+        const agora = new Date();
+        const base  = (atual && !isNaN(atual.getTime()) && atual > agora) ? atual : agora;
+        const novaValidade = new Date(base.getTime() + dias * 24 * 60 * 60 * 1000);
+
+        t.set(settingsRef, {
+            status: 'ativo',
+            validade: Timestamp.fromDate(novaValidade),
+            ultimo_pagamento: Timestamp.fromDate(pagoEm),
+            plano_dias: dias,
+            plano_valor: valor
+        }, { merge: true });
+
+        t.set(pagRef, {
+            ownerId: String(shopId),
+            otica: sd.nomeClinica || sd.nome || String(shopId),
+            valor, dias,
+            planoId, plano: planoNome,
+            data: dataISO(pagoEm),
+            metodo: 'Pix',
+            obs: 'Pix automático',
+            validadeAte: dataISO(novaValidade),
+            validadeISO: novaValidade.toISOString(),
+            origem: 'pix',
+            mpPaymentId: String(pagamento.id),
+            criadoEm: FieldValue.serverTimestamp()
+        });
+        console.log(`✅ Licença VENDAS liberada: ${shopId} +${dias} dias (até ${dataISO(novaValidade)}) — R$ ${valor} — paymentId ${pagamento.id}`);
+        return { validade: novaValidade.toISOString(), jaRegistrado: false };
+    });
+}
+// ============================================================
 // ROTA 1 — Criar pagamento de LICENÇA
 // ============================================================
 app.post('/criar-pagamento', async (req, res) => {
@@ -111,7 +180,10 @@ app.post('/criar-pagamento', async (req, res) => {
                     last_name: 'Otica',
                     identification: { type: 'CPF', number: '00000000000' }
                 },
-                metadata: body.metadata || {}
+                metadata: body.metadata || {},
+                // Sistema de vendas: o Mercado Pago avisa este servidor quando o Pix é pago,
+                // então a licença é liberada mesmo que a ótica feche a página antes da confirmação.
+                ...(sistema === 'vendas' ? { notification_url: `https://${req.get('host')}/webhook` } : {})
             },
             {
                 headers: {
@@ -135,6 +207,11 @@ app.get('/status/:id', async (req, res) => {
             `https://api.mercadopago.com/v1/payments/${req.params.id}`,
             { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
         );
+        // Licença do sistema de vendas: o próprio servidor libera a ótica e registra o pagamento
+        let licenca = null;
+        try { licenca = await confirmarLicencaVendas(response.data); }
+        catch (e) { console.error('Erro ao liberar licença vendas:', e.message); }
+        if (licenca) return res.json({ status: response.data.status, licencaAtivada: true, validade: licenca.validade });
         res.json({ status: response.data.status });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -210,6 +287,15 @@ app.post('/webhook', async (req, res) => {
             .limit(1)
             .get();
         if (snapshot.empty) {
+            // Não é parcela de ótica — pode ser o Pix de uma LICENÇA do sistema de vendas
+            try {
+                const lic = await axios.get(
+                    `https://api.mercadopago.com/v1/payments/${paymentId}`,
+                    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+                );
+                const r = await confirmarLicencaVendas(lic.data);
+                if (r) return;
+            } catch (e) { /* pagamento não é da conta de licenças — segue */ }
             console.log(`Webhook: parcela não encontrada para paymentId ${paymentId}`);
             return;
         }
