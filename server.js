@@ -319,6 +319,60 @@ app.post('/criar-pagamento', async (req, res) => {
     }
 });
 // ============================================================
+// MASTER — gerar Pix de licença para uma ótica (painel "Lançar pagamento")
+// Body: { shopId, dias, valor, planoId?, nomeOtica? }  — só a conta master
+// Quando o Pix é pago, o webhook libera a licença e registra no Financeiro sozinho.
+// ============================================================
+app.post('/master/gerar-pix', async (req, res) => {
+    try {
+        await exigirMaster(req);
+        const { shopId, planoId, nomeOtica } = req.body || {};
+        const dias  = parseInt(req.body?.dias, 10);
+        const valor = Math.round(parseFloat(String(req.body?.valor).replace(',', '.')) * 100) / 100;
+        if (!shopId) return res.status(400).json({ error: 'Ótica não informada.' });
+        if (!dias || dias < 1) return res.status(400).json({ error: 'Informe por quantos dias liberar.' });
+        if (!valor || valor < 1) return res.status(400).json({ error: 'O valor do Pix precisa ser de pelo menos R$ 1,00.' });
+        if (planoId) {
+            await db.collection('master_assinantes').doc(String(shopId)).set({ planoId: String(planoId) }, { merge: true });
+        }
+        const response = await axios.post(
+            'https://api.mercadopago.com/v1/payments',
+            {
+                transaction_amount: valor,
+                description: `Licença ${dias} dias - Sistema de Vendas${nomeOtica ? ' - ' + String(nomeOtica).slice(0, 60) : ''}`,
+                payment_method_id: 'pix',
+                payer: {
+                    email: 'licenca@sistemaotica.com',
+                    first_name: 'Cliente',
+                    last_name: 'Otica',
+                    identification: { type: 'CPF', number: '00000000000' }
+                },
+                metadata: { shop_id: String(shopId), dias, sistema: 'vendas', origem: 'master' },
+                notification_url: `https://${req.get('host')}/webhook`
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${ACCESS_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'X-Idempotency-Key': `master-${shopId}-${Date.now()}`
+                }
+            }
+        );
+        const d = response.data;
+        res.json({
+            paymentId: d.id,
+            status: d.status,
+            qrCode: d.point_of_interaction?.transaction_data?.qr_code || null,
+            qrCodeBase64: d.point_of_interaction?.transaction_data?.qr_code_base64 || null,
+            valor
+        });
+    } catch (err) {
+        console.error('Erro /master/gerar-pix:', JSON.stringify(err.response?.data || err.message));
+        if (err.status) return responderErro(res, err);
+        res.status(500).json({ error: err.response?.data?.message || err.message });
+    }
+});
+// ============================================================
 // ROTA 2 — Verificar status de LICENÇA
 // ============================================================
 app.get('/status/:id', async (req, res) => {
