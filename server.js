@@ -98,29 +98,6 @@ const PRECOS = {
 // master_senhas/{uid}. Só a conta master consegue pedir a senha decifrada.
 // ============================================================
 const MASTER_EMAILS = ['girlanildo@gmail.com'];
-
-// Segundo Firebase: sistema de AGENDA (projeto agendaatendimento-473c1).
-// Configure no Railway a variável FIREBASE_AGENDA_SERVICE_ACCOUNT com o JSON completo
-// da chave de serviço da Agenda (Firebase → Configurações do projeto → Contas de serviço).
-let appAgenda = null;
-try {
-    if (process.env.FIREBASE_AGENDA_SERVICE_ACCOUNT) {
-        appAgenda = initializeApp({ credential: cert(JSON.parse(process.env.FIREBASE_AGENDA_SERVICE_ACCOUNT)) }, 'agenda');
-        console.log('✅ Firebase da Agenda conectado');
-    } else {
-        console.log('ℹ️ FIREBASE_AGENDA_SERVICE_ACCOUNT não configurada — painel master/licenças da Agenda desativados');
-    }
-} catch (e) { console.error('❌ Chave do Firebase da Agenda inválida:', e.message); }
-function ctxSistema(sistema) {
-    if (sistema === 'agenda') {
-        if (!appAgenda) {
-            const e = new Error('A chave do Firebase da Agenda ainda não foi configurada no servidor (variável FIREBASE_AGENDA_SERVICE_ACCOUNT no Railway).');
-            e.status = 503; throw e;
-        }
-        return { auth: getAuth(appAgenda), db: getFirestore(appAgenda) };
-    }
-    return { auth: getAuth(), db };
-}
 const CHAVE_SENHAS = crypto.createHash('sha256')
     .update('senhas-oticas|' + (process.env.SENHAS_CHAVE || process.env.FIREBASE_PRIVATE_KEY || ''))
     .digest();
@@ -138,23 +115,22 @@ function decifrarSenha(guardada) {
         return Buffer.concat([d.update(enc), d.final()]).toString('utf8');
     } catch (e) { return null; }
 }
-async function usuarioDaRequisicao(req, ctx) {
-    ctx = ctx || ctxSistema();
+async function usuarioDaRequisicao(req) {
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : null;
     if (!token) { const e = new Error('Faça login novamente.'); e.status = 401; throw e; }
-    try { return await ctx.auth.verifyIdToken(token); }
+    try { return await getAuth().verifyIdToken(token); }
     catch (err) { const e = new Error('Sessão expirada. Faça login novamente.'); e.status = 401; throw e; }
 }
-async function exigirMaster(req, ctx) {
-    const u = await usuarioDaRequisicao(req, ctx);
+async function exigirMaster(req) {
+    const u = await usuarioDaRequisicao(req);
     if (!MASTER_EMAILS.includes(String(u.email || '').toLowerCase())) {
         const e = new Error('Acesso negado.'); e.status = 403; throw e;
     }
     return u;
 }
-async function guardarSenha(ctx, uid, senha) {
-    await ctx.db.collection('master_senhas').doc(uid).set({
+async function guardarSenha(uid, senha) {
+    await db.collection('master_senhas').doc(uid).set({
         senha: cifrarSenha(senha),
         atualizadaEm: new Date().toISOString()
     });
@@ -169,15 +145,14 @@ const responderErro = (res, err) => res.status(err.status || 500).json({ error: 
 // Lista e-mail e senha das contas (só master). Body: { uids: [...] }
 app.post('/master/contas', async (req, res) => {
     try {
-        const ctx = ctxSistema(req.body?.sistema);
-        await exigirMaster(req, ctx);
+        await exigirMaster(req);
         const uids = Array.isArray(req.body?.uids) ? req.body.uids.filter(Boolean).map(String) : [];
         const resultado = {};
         for (let i = 0; i < uids.length; i += 100) {
             const lote = uids.slice(i, i + 100);
             const [usuarios, senhas] = await Promise.all([
-                ctx.auth.getUsers(lote.map(uid => ({ uid }))),
-                ctx.db.getAll(...lote.map(uid => ctx.db.collection('master_senhas').doc(uid)))
+                getAuth().getUsers(lote.map(uid => ({ uid }))),
+                db.getAll(...lote.map(uid => db.collection('master_senhas').doc(uid)))
             ]);
             const senhaPorUid = {};
             senhas.forEach(d => { if (d.exists) senhaPorUid[d.id] = d.data(); });
@@ -206,13 +181,12 @@ app.post('/master/contas', async (req, res) => {
 // Master define uma nova senha para a conta de uma ótica. Body: { uid, senha }
 app.post('/master/definir-senha', async (req, res) => {
     try {
-        const ctx = ctxSistema(req.body?.sistema);
-        await exigirMaster(req, ctx);
+        await exigirMaster(req);
         const { uid, senha } = req.body || {};
         if (!uid) return res.status(400).json({ error: 'uid obrigatório' });
         validarSenha(senha);
-        await ctx.auth.updateUser(String(uid), { password: senha });
-        await guardarSenha(ctx, String(uid), senha);
+        await getAuth().updateUser(String(uid), { password: senha });
+        await guardarSenha(String(uid), senha);
         console.log(`🔑 Master definiu nova senha para ${uid}`);
         res.json({ ok: true });
     } catch (err) {
@@ -224,12 +198,11 @@ app.post('/master/definir-senha', async (req, res) => {
 // A própria ótica troca a senha dela (logada). Body: { novaSenha }
 app.post('/conta/alterar-senha', async (req, res) => {
     try {
-        const ctx = ctxSistema(req.body?.sistema);
-        const u = await usuarioDaRequisicao(req, ctx);
+        const u = await usuarioDaRequisicao(req);
         const { novaSenha } = req.body || {};
         validarSenha(novaSenha);
-        await ctx.auth.updateUser(u.uid, { password: novaSenha });
-        await guardarSenha(ctx, u.uid, novaSenha);
+        await getAuth().updateUser(u.uid, { password: novaSenha });
+        await guardarSenha(u.uid, novaSenha);
         console.log(`🔑 Conta ${u.uid} trocou a própria senha`);
         res.json({ ok: true });
     } catch (err) { responderErro(res, err); }
@@ -242,25 +215,17 @@ app.post('/conta/alterar-senha', async (req, res) => {
 // • grava o pagamento em master_pagamentos (aparece no Financeiro do painel master)
 // É seguro chamar várias vezes: o mesmo pagamento só é contado uma vez.
 // ============================================================
-// Onde fica a licença de cada sistema
-const LICENCAS = {
-    vendas: { colecao: 'settings',      campoNome: 'nomeClinica' },
-    agenda: { colecao: 'configuracoes', campoNome: 'nome' },
-};
 async function confirmarLicencaVendas(pagamento) {
     const meta    = pagamento.metadata || {};
     const shopId  = meta.shop_id || meta.shopId;
-    const cfgLic  = LICENCAS[meta.sistema];
-    if (pagamento.status !== 'approved' || !cfgLic || !shopId) return null;
-    if (meta.sistema === 'agenda' && !appAgenda) return null; // sem a chave da Agenda: a página libera como antes
-    const db = ctxSistema(meta.sistema).db;
+    if (pagamento.status !== 'approved' || meta.sistema !== 'vendas' || !shopId) return null;
 
     const dias  = parseInt(meta.dias) || 30;
     const valor = Number(pagamento.transaction_amount) || 0;
     const pagoEm = pagamento.date_approved ? new Date(pagamento.date_approved) : new Date();
     const dataISO = (d) => d.toLocaleDateString('en-CA', { timeZone: 'America/Manaus' }); // AAAA-MM-DD
 
-    const settingsRef = db.collection(cfgLic.colecao).doc(String(shopId));
+    const settingsRef = db.collection('settings').doc(String(shopId));
     const pagRef      = db.collection('master_pagamentos').doc('mp_' + pagamento.id);
 
     // nome do plano que o master definiu para esta ótica (só para exibir no Financeiro)
@@ -296,7 +261,7 @@ async function confirmarLicencaVendas(pagamento) {
 
         t.set(pagRef, {
             ownerId: String(shopId),
-            otica: sd[cfgLic.campoNome] || sd.nomeClinica || sd.nome || String(shopId),
+            otica: sd.nomeClinica || sd.nome || String(shopId),
             valor, dias,
             planoId, plano: planoNome,
             data: dataISO(pagoEm),
@@ -308,7 +273,7 @@ async function confirmarLicencaVendas(pagamento) {
             mpPaymentId: String(pagamento.id),
             criadoEm: FieldValue.serverTimestamp()
         });
-        console.log(`✅ Licença ${String(meta.sistema).toUpperCase()} liberada: ${shopId} +${dias} dias (até ${dataISO(novaValidade)}) — R$ ${valor} — paymentId ${pagamento.id}`);
+        console.log(`✅ Licença VENDAS liberada: ${shopId} +${dias} dias (até ${dataISO(novaValidade)}) — R$ ${valor} — paymentId ${pagamento.id}`);
         return { validade: novaValidade.toISOString(), jaRegistrado: false };
     });
 }
@@ -338,7 +303,7 @@ app.post('/criar-pagamento', async (req, res) => {
                 metadata: body.metadata || {},
                 // Sistema de vendas: o Mercado Pago avisa este servidor quando o Pix é pago,
                 // então a licença é liberada mesmo que a ótica feche a página antes da confirmação.
-                ...(LICENCAS[sistema] ? { notification_url: `https://${req.get('host')}/webhook` } : {})
+                ...(sistema === 'vendas' ? { notification_url: `https://${req.get('host')}/webhook` } : {})
             },
             {
                 headers: {
@@ -365,13 +330,34 @@ app.get('/status/:id', async (req, res) => {
         // Licença do sistema de vendas: o próprio servidor libera a ótica e registra o pagamento
         let licenca = null;
         try { licenca = await confirmarLicencaVendas(response.data); }
-        catch (e) { console.error('Erro ao liberar licença:', e.message); }
+        catch (e) { console.error('Erro ao liberar licença vendas:', e.message); }
         if (licenca) return res.json({ status: response.data.status, licencaAtivada: true, validade: licenca.validade });
         res.json({ status: response.data.status });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
+// Tokens de Mercado Pago de uma ótica: o atual primeiro, depois os anteriores.
+// Assim, carnês gerados com a conta antiga (ex.: PF) continuam com baixa automática
+// mesmo depois de a ótica trocar o token para a conta nova (ex.: PJ).
+function tokensMPdaOtica(settings) {
+    const lista = [];
+    if (settings?.mpAccessToken) lista.push(settings.mpAccessToken);
+    (Array.isArray(settings?.mpAccessTokensAnteriores) ? settings.mpAccessTokensAnteriores : [])
+        .forEach(t => { if (t && !lista.includes(t)) lista.push(t); });
+    return lista;
+}
+async function consultarPagamentoMP(paymentId, tokens) {
+    let ultimoErro = null;
+    for (const t of tokens) {
+        try {
+            const r = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`,
+                { headers: { Authorization: `Bearer ${t}` } });
+            return r.data;
+        } catch (e) { ultimoErro = e; }
+    }
+    throw ultimoErro || new Error('Nenhum token de Mercado Pago cadastrado');
+}
 // ============================================================
 // ROTA 3 — Criar pagamento Pix de PARCELA (Mercado Pago)
 // ============================================================
@@ -408,7 +394,8 @@ app.post('/criar-parcela', async (req, res) => {
                 metadata: {
                     installment_id: installmentId,
                     tipo: 'parcela'
-                }
+                },
+                notification_url: `https://${req.get('host')}/webhook`
             },
             {
                 headers: {
@@ -458,22 +445,17 @@ app.post('/webhook', async (req, res) => {
         const docData = snapshot.docs[0].data();
         const ownerId = docData.ownerId;
         if (docData.pago === true) return;
-        let mpToken = null;
+        let tokens = [];
         if (ownerId) {
             const settingsDoc = await db.collection('settings').doc(ownerId).get();
-            if (settingsDoc.exists) {
-                mpToken = settingsDoc.data()?.mpAccessToken || null;
-            }
+            if (settingsDoc.exists) tokens = tokensMPdaOtica(settingsDoc.data());
         }
-        if (!mpToken) {
+        if (!tokens.length) {
             console.log(`Webhook: token não encontrado para ownerId ${ownerId}`);
             return;
         }
-        const statusRes = await axios.get(
-            `https://api.mercadopago.com/v1/payments/${paymentId}`,
-            { headers: { Authorization: `Bearer ${mpToken}` } }
-        );
-        if (statusRes.data.status !== 'approved') return;
+        const pagamento = await consultarPagamentoMP(paymentId, tokens);
+        if (pagamento.status !== 'approved') return;
         const hoje = new Date().toISOString();
         await docRef.update({
             pago: true,
@@ -895,13 +877,10 @@ const verificarParcelasPendentes = async () => {
             if (mpPaymentId && mpPaymentId !== 'null') {
                 try {
                     const settings = await getSettings(ownerId);
-                    const mpToken = settings?.mpAccessToken;
-                    if (mpToken) {
-                        const statusRes = await axios.get(
-                            `https://api.mercadopago.com/v1/payments/${mpPaymentId}`,
-                            { headers: { Authorization: `Bearer ${mpToken}` } }
-                        );
-                        if (statusRes.data.status === 'approved') {
+                    const tokens = tokensMPdaOtica(settings);
+                    if (tokens.length) {
+                        const pagamento = await consultarPagamentoMP(mpPaymentId, tokens);
+                        if (pagamento.status === 'approved') {
                             const hoje = new Date().toISOString();
                             await doc.ref.update({
                                 pago: true, status: 'pago',
