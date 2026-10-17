@@ -262,6 +262,69 @@ app.post('/master/excluir-clinica', async (req, res) => {
     } catch (err) { console.error('[master/excluir-clinica]', err.message); responderErro(res, err); }
 });
 
+// ── Usuários da ótica (tela Configurações → Usuários) ─────────────────────
+// Confere se quem chamou pode mexer no usuário `uid`: o dono da ótica, um
+// administrador da mesma ótica ou o master. Devolve { alvoRef, alvo }.
+async function exigirGestorDoUsuario(req, uid) {
+    const u = await usuarioDaRequisicao(req);
+    if (!uid || String(uid).includes('/')) { const e = new Error('Usuário inválido.'); e.status = 400; throw e; }
+    const alvoRef = db.collection('usuarios').doc(String(uid));
+    const alvoSnap = await alvoRef.get();
+    if (!alvoSnap.exists) { const e = new Error('Usuário não encontrado.'); e.status = 404; throw e; }
+    const alvo = alvoSnap.data() || {};
+    if (String(uid) === String(alvo.ownerId || '')) { const e = new Error('A conta principal da ótica não pode ser alterada por aqui.'); e.status = 400; throw e; }
+    let pode = MASTER_EMAILS.includes(String(u.email || '').toLowerCase()) || u.uid === alvo.ownerId;
+    if (!pode) {
+        const eu = await db.collection('usuarios').doc(u.uid).get();
+        pode = eu.exists && eu.data().ownerId === alvo.ownerId && (eu.data().perfil === 'admin' || eu.data().admin === true);
+    }
+    if (!pode) { const e = new Error('Acesso negado.'); e.status = 403; throw e; }
+    return { alvoRef, alvo, quem: u };
+}
+
+// Edita um usuário da ótica: nome, e-mail de login, perfil e (opcional) nova senha.
+// Body: { uid, nome, email, perfil, senha? }
+app.post('/conta/editar-usuario', async (req, res) => {
+    try {
+        const { uid, nome, email, perfil, senha } = req.body || {};
+        const { alvoRef } = await exigirGestorDoUsuario(req, uid);
+        const novoNome = String(nome || '').trim();
+        const novoEmail = String(email || '').trim().toLowerCase();
+        if (!novoNome) return res.status(400).json({ error: 'Informe o nome.' });
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(novoEmail)) return res.status(400).json({ error: 'E-mail inválido.' });
+        const perfis = ['vendedor', 'caixa', 'leitura', 'admin'];
+        const dadosAuth = { email: novoEmail, displayName: novoNome };
+        if (senha) { validarSenha(senha); dadosAuth.password = senha; }
+        await getAuth().updateUser(String(uid), dadosAuth);
+        if (senha) await guardarSenha(String(uid), senha);
+        const dados = { nome: novoNome, email: novoEmail, atualizadoEm: FieldValue.serverTimestamp() };
+        if (perfis.includes(perfil)) dados.perfil = perfil;
+        await alvoRef.set(dados, { merge: true });
+        console.log(`✏️  Usuário ${uid} editado (${novoEmail})`);
+        res.json({ ok: true });
+    } catch (err) {
+        if (err.code === 'auth/email-already-exists') return res.status(400).json({ error: 'Já existe outra conta com este e-mail.' });
+        if (err.code === 'auth/invalid-email') return res.status(400).json({ error: 'E-mail inválido.' });
+        if (err.code === 'auth/user-not-found') return res.status(404).json({ error: 'Conta não encontrada no Firebase.' });
+        responderErro(res, err);
+    }
+});
+
+// Exclui um usuário da ótica: login do Firebase + cadastro. Body: { uid }
+app.post('/conta/excluir-usuario', async (req, res) => {
+    try {
+        const { uid } = req.body || {};
+        const { alvoRef, quem } = await exigirGestorDoUsuario(req, uid);
+        if (quem.uid === String(uid)) return res.status(400).json({ error: 'Você não pode excluir a sua própria conta.' });
+        try { await getAuth().deleteUser(String(uid)); }
+        catch (e) { if (e.code !== 'auth/user-not-found') throw e; }
+        await alvoRef.delete();
+        try { await db.collection('master_senhas').doc(String(uid)).delete(); } catch (e) { /* não existia */ }
+        console.log(`🗑️  Usuário ${uid} excluído`);
+        res.json({ ok: true });
+    } catch (err) { responderErro(res, err); }
+});
+
 // A própria ótica troca a senha dela (logada). Body: { novaSenha }
 app.post('/conta/alterar-senha', async (req, res) => {
     try {
