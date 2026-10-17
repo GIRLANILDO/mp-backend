@@ -195,6 +195,73 @@ app.post('/master/definir-senha', async (req, res) => {
     }
 });
 
+// Painel master: EXCLUI DEFINITIVAMENTE uma ótica (ex.: demonstração que não virou cliente).
+// Apaga os logins (Firebase Authentication) e TODOS os documentos da ótica no Firestore.
+// Body: { clinicId } — só a conta master. Nunca apaga a ótica do próprio master.
+app.post('/master/excluir-clinica', async (req, res) => {
+    try {
+        const master = await exigirMaster(req);
+        const cid = String((req.body || {}).clinicId || '').trim();
+        if (!cid || cid.includes('/')) return res.status(400).json({ error: 'Ótica inválida.' });
+
+        const meu = await db.collection('usuarios').doc(master.uid).get();
+        if (cid === master.uid || (meu.exists && meu.data().ownerId === cid)) {
+            return res.status(400).json({ error: 'Você não pode excluir a sua própria ótica.' });
+        }
+
+        const resumo = { contasLogin: 0, documentos: 0 };
+        const jaApagados = new Set();
+        const apagar = async (refs) => {                 // apaga em lotes de até 400, sem repetir
+            refs = refs.filter(r => !jaApagados.has(r.path));
+            refs.forEach(r => jaApagados.add(r.path));
+            for (let i = 0; i < refs.length; i += 400) {
+                const lote = refs.slice(i, i + 400);
+                const b = db.batch(); lote.forEach(r => b.delete(r)); await b.commit();
+                resumo.documentos += lote.length;
+            }
+        };
+
+        // 1) Contas da ótica: o dono (uid = id da ótica) + usuários vinculados a ela
+        const us = await db.collection('usuarios').where('ownerId', '==', cid).get();
+        const uids = new Set(us.docs.map(d => d.id));
+        uids.add(cid);
+        uids.delete(master.uid);
+        const listaUids = [...uids];
+
+        // 2) Todos os documentos ligados à ótica (campo userId ou ownerId), em TODAS as coleções
+        //    (clientes, vendas, parcelas, produtos, despesas, lembretes, mensagens, notificações,
+        //     links de acesso, histórico de atividades, pagamentos do painel master, usuários...)
+        const colecoes = await db.listCollections();
+        for (const c of colecoes) {
+            for (const campo of ['userId', 'ownerId']) {
+                for (let i = 0; i < listaUids.length; i += 30) {
+                    const snap = await c.where(campo, 'in', listaUids.slice(i, i + 30)).get();
+                    if (!snap.empty) await apagar(snap.docs.map(d => d.ref));
+                }
+            }
+        }
+
+        // 3) Documentos cujo ID é o da ótica ou de um usuário dela
+        const refsId = [];
+        for (const uid of listaUids) {
+            for (const nome of ['settings', 'ownerConfigs', 'master_assinantes', 'usuarios', 'master_senhas']) {
+                const r = db.collection(nome).doc(uid);
+                if ((await r.get()).exists) refsId.push(r);
+            }
+        }
+        if (refsId.length) await apagar(refsId);
+
+        // 4) Logins no Firebase Authentication (por último, depois dos dados)
+        for (const uid of listaUids) {
+            try { await getAuth().deleteUser(uid); resumo.contasLogin++; }
+            catch (e) { if (e.code !== 'auth/user-not-found') console.warn('[excluir-clinica] auth', uid, e.message); }
+        }
+
+        console.log(`🗑️  Ótica EXCLUÍDA pelo master: ${cid} | logins: ${resumo.contasLogin} | documentos: ${resumo.documentos}`);
+        res.json({ ok: true, resumo });
+    } catch (err) { console.error('[master/excluir-clinica]', err.message); responderErro(res, err); }
+});
+
 // A própria ótica troca a senha dela (logada). Body: { novaSenha }
 app.post('/conta/alterar-senha', async (req, res) => {
     try {
