@@ -1031,6 +1031,114 @@ app.post('/asaas/cancelar-carne', async (req, res) => {
     }
 });
 // ============================================================
+// ROTA 11b — Alterar VENCIMENTO de parcela no MERCADO PAGO
+// O Pix do MP não tem "vencimento" editável: o QR só tem data de expiração
+// (no /criar-parcela ela é o vencimento + 1 ano). Então:
+//   • se o QR atual continua válido para a nova data → mantém o mesmo Pix (carnê antigo segue funcionando)
+//   • se a nova data passa da validade → cancela o Pix antigo e gera um novo para a mesma parcela
+// O webhook acha a parcela pelo mpPaymentId — o sistema grava o novo id na parcela.
+// ============================================================
+app.post('/mp/alterar-vencimento', async (req, res) => {
+    try {
+        const { mpAccessToken, mpAccessTokensAnteriores, installmentId, paymentIdAntigo,
+                amount, dueDate, description, payerEmail, forcarNovo } = req.body;
+        if (!mpAccessToken) return res.status(400).json({ ok: false, error: 'Token da ótica não informado.' });
+        if (!installmentId) return res.status(400).json({ ok: false, error: 'ID da parcela não informado.' });
+        if (!amount || amount <= 0) return res.status(400).json({ ok: false, error: 'Valor inválido.' });
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate || '')) return res.status(400).json({ ok: false, error: 'Data inválida.' });
+        const tokens = [mpAccessToken, ...(Array.isArray(mpAccessTokensAnteriores) ? mpAccessTokensAnteriores : [])]
+            .filter((t, i, a) => t && a.indexOf(t) === i);
+
+        // 1. Confere o Pix atual
+        let tokenDoAntigo = null;
+        if (paymentIdAntigo) {
+            for (const t of tokens) {
+                try {
+                    const r = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentIdAntigo}`,
+                        { headers: { Authorization: `Bearer ${t}` } });
+                    const p = r.data; tokenDoAntigo = t;
+                    if (p.status === 'approved') return res.status(409).json({ ok: false, error: 'Este Pix já foi pago no Mercado Pago.' });
+                    const expira = p.date_of_expiration ? new Date(p.date_of_expiration) : null;
+                    const limite = new Date(dueDate + 'T23:59:59-04:00'); limite.setDate(limite.getDate() + 30);
+                    if (!forcarNovo && p.status === 'pending' && expira && expira > limite) {
+                        console.log(`[MP vencimento] Parcela ${installmentId}: QR ${paymentIdAntigo} continua válido até ${p.date_of_expiration}`);
+                        return res.json({ ok: true, mantido: true, paymentId: p.id, expiraEm: p.date_of_expiration });
+                    }
+                    break;
+                } catch (e) { /* tenta o próximo token */ }
+            }
+            // 2. Cancela o Pix antigo
+            if (tokenDoAntigo) {
+                try {
+                    await axios.put(`https://api.mercadopago.com/v1/payments/${paymentIdAntigo}`, { status: 'cancelled' },
+                        { headers: { Authorization: `Bearer ${tokenDoAntigo}`, 'Content-Type': 'application/json' } });
+                } catch (e) {
+                    console.warn('[MP vencimento] Não cancelou o Pix antigo:', JSON.stringify(e.response?.data || e.message));
+                }
+            }
+        }
+
+        // 3. Gera o novo Pix (mesmas regras do /criar-parcela: expira 1 ano após o vencimento)
+        const expiration = new Date(dueDate + 'T12:00:00');
+        expiration.setFullYear(expiration.getFullYear() + 1);
+        const pad = (n) => String(n).padStart(2, '0');
+        const expirationISO = expiration.getUTCFullYear() + '-' + pad(expiration.getUTCMonth()+1) + '-' +
+            pad(expiration.getUTCDate()) + 'T' + pad(expiration.getUTCHours()) + ':' +
+            pad(expiration.getUTCMinutes()) + ':' + pad(expiration.getUTCSeconds()) + '.000-04:00';
+        const response = await axios.post('https://api.mercadopago.com/v1/payments', {
+            transaction_amount: parseFloat(amount),
+            description: description || `Parcela - ${installmentId}`,
+            payment_method_id: 'pix',
+            date_of_expiration: expirationISO,
+            payer: {
+                email: payerEmail || 'cliente@otica.com',
+                first_name: 'Cliente', last_name: 'Otica',
+                identification: { type: 'CPF', number: '00000000000' }
+            },
+            metadata: { installment_id: installmentId, tipo: 'parcela' },
+            notification_url: `https://${req.get('host')}/webhook`
+        }, {
+            headers: { Authorization: `Bearer ${mpAccessToken}`, 'Content-Type': 'application/json', 'X-Idempotency-Key': `${installmentId}-${Date.now()}` }
+        });
+        const data = response.data;
+        console.log(`[MP vencimento] Parcela ${installmentId}: novo Pix ${data.id} (antigo ${paymentIdAntigo || '—'})`);
+        res.json({
+            ok: true, mantido: false, paymentId: data.id,
+            qrCodeBase64: data.point_of_interaction?.transaction_data?.qr_code_base64 || null,
+            qrCode: data.point_of_interaction?.transaction_data?.qr_code || null
+        });
+    } catch (err) {
+        console.error('Erro /mp/alterar-vencimento:', JSON.stringify(err.response?.data || err.message));
+        res.status(500).json({ ok: false, error: err.response?.data?.message || err.message });
+    }
+});
+// ============================================================
+// ROTA 11c — Alterar VENCIMENTO de parcela no ASAAS (boleto / carnê)
+// O Asaas altera a própria cobrança: o link do boleto e o carnê PDF já saem com a nova data.
+// ============================================================
+app.post('/asaas/alterar-vencimento', async (req, res) => {
+    try {
+        const { asaasToken, asaasAmbiente, paymentId, dueDate } = req.body;
+        if (!asaasToken) return res.status(400).json({ ok: false, error: 'asaasToken obrigatório' });
+        if (!paymentId)  return res.status(400).json({ ok: false, error: 'paymentId obrigatório' });
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate || '')) return res.status(400).json({ ok: false, error: 'Data inválida.' });
+        const base = asaasAmbiente === 'producao' ? 'https://api.asaas.com/v3' : 'https://sandbox.asaas.com/api/v3';
+        const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
+        const atual = await axios.get(`${base}/payments/${paymentId}`, { headers });
+        if (['RECEIVED', 'CONFIRMED', 'RECEIVED_IN_CASH'].includes(atual.data.status))
+            return res.status(409).json({ ok: false, error: 'Esta cobrança já foi paga no Asaas.' });
+        const r = await axios.post(`${base}/payments/${paymentId}`, { dueDate }, { headers });
+        let pixQrCode = null;
+        try { const q = await axios.get(`${base}/payments/${paymentId}/pixQrCode`, { headers }); pixQrCode = q.data.payload || null; } catch (e) {}
+        console.log(`[Asaas vencimento] Cobrança ${paymentId} → ${dueDate}`);
+        res.json({ ok: true, boletoUrl: r.data.bankSlipUrl || null, invoiceUrl: r.data.invoiceUrl || null, pixQrCode, dueDate: r.data.dueDate });
+    } catch (err) {
+        const msg = err.response?.data?.errors?.[0]?.description || err.message;
+        console.error('[Asaas vencimento] Erro:', err.response?.status, JSON.stringify(err.response?.data));
+        res.status(err.response?.status === 409 ? 409 : 500).json({ ok: false, error: msg });
+    }
+});
+// ============================================================
 // VERIFICAÇÃO AUTOMÁTICA — a cada 5 minutos confere parcelas pendentes
 // ============================================================
 const verificarParcelasPendentes = async () => {
