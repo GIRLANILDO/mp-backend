@@ -987,47 +987,64 @@ app.get('/asaas/carne/:saleId', async (req, res) => {
     }
 });
 // ============================================================
-// ROTA 10 — Cancelar PAGAMENTO INDIVIDUAL no Asaas
+// ROTA 10 — EXCLUIR COBRANÇA INDIVIDUAL no Asaas (DELETE /payments/{id})
 // ============================================================
 app.post('/asaas/cancelar-pagamento', async (req, res) => {
     try {
         const { asaasToken, asaasAmbiente, paymentId } = req.body;
-        if (!asaasToken) return res.status(400).json({ error: 'asaasToken obrigatório' });
-        if (!paymentId)  return res.status(400).json({ error: 'paymentId obrigatório' });
+        if (!asaasToken) return res.status(400).json({ ok: false, error: 'asaasToken obrigatório' });
+        if (!paymentId)  return res.status(400).json({ ok: false, error: 'paymentId obrigatório' });
         const base = asaasAmbiente === 'producao'
             ? 'https://api.asaas.com/v3'
             : 'https://sandbox.asaas.com/api/v3';
-        const r = await axios.post(
-            `${base}/payments/${paymentId}/cancel`, {},
-            { headers: { 'access_token': asaasToken, 'Content-Type': 'application/json' } }
-        );
-        console.log(`[Asaas] Pagamento ${paymentId} cancelado. Status: ${r.data.status}`);
-        res.json(r.data);
+        const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
+        try {
+            await axios.delete(`${base}/payments/${paymentId}`, { headers });
+            console.log(`[Asaas] Cobrança ${paymentId} excluída.`);
+            return res.json({ ok: true });
+        } catch (e) {
+            if (e.response?.status === 404) return res.json({ ok: true, jaRemovida: true });
+            const msg = e.response?.data?.errors?.[0]?.description || e.message;
+            console.error('[Asaas] Erro ao excluir cobrança:', e.response?.status, JSON.stringify(e.response?.data));
+            return res.status(e.response?.status || 500).json({ ok: false, error: msg });
+        }
     } catch (err) {
-        console.error('[Asaas] Erro ao cancelar pagamento:', err.response?.status, JSON.stringify(err.response?.data));
-        res.status(err.response?.status || 500).json({ error: err.message, details: err.response?.data });
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 // ============================================================
-// ROTA 11 — Cancelar CARNÊ INTEIRO no Asaas
+// ROTA 11 — EXCLUIR CARNÊ INTEIRO no Asaas (DELETE /installments/{id})
+// Se alguma parcela já foi paga, o Asaas não deixa remover o carnê inteiro:
+// aí remove só as cobranças pendentes/vencidas (DELETE /installments/{id}/payments).
 // ============================================================
 app.post('/asaas/cancelar-carne', async (req, res) => {
     try {
         const { asaasToken, asaasAmbiente, installmentId } = req.body;
-        if (!asaasToken)    return res.status(400).json({ error: 'asaasToken obrigatório' });
-        if (!installmentId) return res.status(400).json({ error: 'installmentId obrigatório' });
+        if (!asaasToken)    return res.status(400).json({ ok: false, error: 'asaasToken obrigatório' });
+        if (!installmentId) return res.status(400).json({ ok: false, error: 'installmentId obrigatório' });
         const base = asaasAmbiente === 'producao'
             ? 'https://api.asaas.com/v3'
             : 'https://sandbox.asaas.com/api/v3';
-        const r = await axios.post(
-            `${base}/installments/${installmentId}/cancel`, {},
-            { headers: { 'access_token': asaasToken, 'Content-Type': 'application/json' } }
-        );
-        console.log(`[Asaas] Carnê ${installmentId} cancelado.`);
-        res.json(r.data);
+        const headers = { 'access_token': asaasToken, 'Content-Type': 'application/json' };
+        try {
+            await axios.delete(`${base}/installments/${installmentId}`, { headers });
+            console.log(`[Asaas] Carnê ${installmentId} excluído.`);
+            return res.json({ ok: true, modo: 'carne' });
+        } catch (e) {
+            if (e.response?.status === 404) return res.json({ ok: true, jaRemovido: true });
+            console.warn('[Asaas] Carnê inteiro não removido, tentando só as pendentes:', JSON.stringify(e.response?.data));
+            try {
+                await axios.delete(`${base}/installments/${installmentId}/payments`, { headers });
+                console.log(`[Asaas] Cobranças pendentes do carnê ${installmentId} excluídas.`);
+                return res.json({ ok: true, modo: 'pendentes' });
+            } catch (e2) {
+                const msg = e2.response?.data?.errors?.[0]?.description || e.response?.data?.errors?.[0]?.description || e2.message;
+                console.error('[Asaas] Erro ao excluir carnê:', e2.response?.status, JSON.stringify(e2.response?.data));
+                return res.status(e2.response?.status || 500).json({ ok: false, error: msg });
+            }
+        }
     } catch (err) {
-        console.error('[Asaas] Erro ao cancelar carnê:', err.response?.status, JSON.stringify(err.response?.data));
-        res.status(err.response?.status || 500).json({ error: err.message, details: err.response?.data });
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 // ============================================================
